@@ -2,10 +2,11 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 import type { HoverPreviewHandlers } from "../../app/App";
-import { DeckSnapshot, getImageUri, getManaValue, getOracleText, getPrimaryTypeLine } from "../../deck/deckModel";
+import { DeckSnapshot, getImageUri, getOracleText, getPrimaryTypeLine } from "../../deck/deckModel";
 import { countQuery, getCardById, queryDeck } from "../../deck/deckQueries";
 import { AnalysisLayoutNode, AnalysisResult } from "../../analysis/analysisSchema";
 import { ColorPipChart, ManaCurveChart, TypeBreakdownChart } from "../charts/DeckCharts";
+import { DeckStackCard } from "../deck-card/DeckStackCard";
 
 export type AnalysisNodePath = Array<string | number>;
 
@@ -222,19 +223,12 @@ function CardList({
         <div className="analysis-card-list">
           {cards.length ? (
             cards.map((card) => (
-              <button
+              <DeckStackCard
                 key={card!.id}
-                type="button"
-                onClick={() => onSelectCard(card!.id)}
-                onMouseEnter={(event) => hoverPreview?.show(card!.id, event.currentTarget)}
-                onMouseLeave={hoverPreview?.hide}
-                onFocus={(event) => hoverPreview?.show(card!.id, event.currentTarget)}
-                onBlur={hoverPreview?.hide}
-              >
-                <span>{card!.quantity}x</span>
-                <strong>{card!.name}</strong>
-                <em>MV {getManaValue(card!)}</em>
-              </button>
+                entry={card!}
+                hoverPreview={hoverPreview}
+                onSelect={() => onSelectCard(card!.id)}
+              />
             ))
           ) : (
             <p>{node.emptyText ?? "No cards found."}</p>

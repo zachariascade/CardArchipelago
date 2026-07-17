@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
-import { ArrowDownAZ, ArrowUpAZ, ChevronDown, ChevronRight, Search } from "lucide-react";
-import { DeckEntry, DeckSnapshot, DECK_CATEGORIES, categorizeEntry, getImageUri, getManaValue, getPrimaryTypeLine } from "../../deck/deckModel";
+import { ArrowDownAZ, ArrowUpAZ, ChevronDown, ChevronRight, Plus, Search } from "lucide-react";
+import { DeckBoard, DeckEntry, DeckSnapshot, DECK_CATEGORIES, categorizeEntry, getEntryBoard, getManaValue, getPrimaryTypeLine } from "../../deck/deckModel";
+import { DeckStackCard } from "../deck-card/DeckStackCard";
 
 export type SortMode = "category" | "name" | "manaValue";
 export type FilterMode = "all" | "creatures" | "nonlands" | "lands";
@@ -18,6 +19,12 @@ export function DeckGrid({
   onFilterModeChange,
   onSortAscendingChange,
   onSelectCard,
+  onMoveCardToBoard,
+  onDeleteCard,
+  onAddCard,
+  onSearchCardNames,
+  addCardStatus,
+  isAddingCard,
 }: {
   deck: DeckSnapshot;
   selectedCardId?: string;
@@ -30,18 +37,196 @@ export function DeckGrid({
   onFilterModeChange: (value: FilterMode) => void;
   onSortAscendingChange: (value: boolean) => void;
   onSelectCard: (cardId: string) => void;
+  onMoveCardToBoard: (cardId: string, board: DeckBoard) => void;
+  onDeleteCard: (cardId: string) => void;
+  onAddCard: (name: string, quantity: number, board: DeckBoard) => void;
+  onSearchCardNames: (query: string) => Promise<string[]>;
+  addCardStatus?: string;
+  isAddingCard?: boolean;
 }) {
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
+  const [openCardMenuId, setOpenCardMenuId] = useState<string>();
+  const [addCardName, setAddCardName] = useState("");
+  const [addCardQuantity, setAddCardQuantity] = useState(1);
+  const [addCardBoard, setAddCardBoard] = useState<DeckBoard>("mainboard");
+  const [cardSuggestions, setCardSuggestions] = useState<string[]>([]);
+  const [isSearchingCards, setIsSearchingCards] = useState(false);
+  const [cardSearchError, setCardSearchError] = useState<string>();
+  const [isSuggestionOpen, setIsSuggestionOpen] = useState(false);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
+  const cardSearchRequestId = useRef(0);
   const filtered = deck.entries.filter((entry) => matchesControls(entry, deck, search, filterMode));
-  const groups = DECK_CATEGORIES.map((category) => ({
-    category,
-    entries: filtered
-      .filter((entry) => categorizeEntry(entry, deck) === category)
-      .sort((a, b) => sortEntries(a, b, sortMode, sortAscending)),
-  })).filter((group) => group.entries.length > 0);
+  const trimmedAddCardName = addCardName.trim();
+  const showSuggestions = isSuggestionOpen && (cardSuggestions.length > 0 || isSearchingCards || Boolean(cardSearchError));
+  const boards = (["mainboard", "sideboard"] as const)
+    .map((board) => {
+      const boardEntries = filtered.filter((entry) => getEntryBoard(entry) === board);
+      const groups = DECK_CATEGORIES.map((category) => ({
+        category,
+        entries: boardEntries
+          .filter((entry) => categorizeEntry(entry, deck) === category)
+          .sort((a, b) => sortEntries(a, b, sortMode, sortAscending)),
+      })).filter((group) => group.entries.length > 0);
+      return {
+        board,
+        title: board === "mainboard" ? "Mainboard" : "Sideboard",
+        count: boardEntries.reduce((sum, entry) => sum + entry.quantity, 0),
+        groups,
+      };
+    })
+    .filter((boardGroup) => boardGroup.groups.length > 0);
+
+  useEffect(() => {
+    if (!openCardMenuId) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest(".deck-card-menu")) return;
+      setOpenCardMenuId(undefined);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenCardMenuId(undefined);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openCardMenuId]);
+
+  useEffect(() => {
+    const query = addCardName.trim();
+    setActiveSuggestionIndex(0);
+    if (query.length < 2) {
+      cardSearchRequestId.current += 1;
+      setCardSuggestions([]);
+      setIsSearchingCards(false);
+      setCardSearchError(undefined);
+      return;
+    }
+
+    const requestId = cardSearchRequestId.current + 1;
+    cardSearchRequestId.current = requestId;
+    setIsSearchingCards(true);
+    setCardSearchError(undefined);
+    const timeoutId = window.setTimeout(() => {
+      void onSearchCardNames(query)
+        .then((names) => {
+          if (cardSearchRequestId.current !== requestId) return;
+          setCardSuggestions(names.slice(0, 8));
+        })
+        .catch((error) => {
+          if (cardSearchRequestId.current !== requestId) return;
+          setCardSuggestions([]);
+          setCardSearchError(error instanceof Error ? error.message : "Could not search Scryfall.");
+        })
+        .finally(() => {
+          if (cardSearchRequestId.current === requestId) setIsSearchingCards(false);
+        });
+    }, 220);
+    return () => window.clearTimeout(timeoutId);
+  }, [addCardName, onSearchCardNames]);
+
+  function chooseCardSuggestion(name: string): void {
+    setAddCardName(name);
+    setCardSuggestions([]);
+    setIsSuggestionOpen(false);
+    setCardSearchError(undefined);
+    setActiveSuggestionIndex(0);
+  }
 
   return (
     <section className="deck-workspace">
+      <form
+        className="add-card-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const name = addCardName.trim();
+          if (!name || isAddingCard) return;
+          onAddCard(name, addCardQuantity, addCardBoard);
+          setAddCardName("");
+          setAddCardQuantity(1);
+        }}
+      >
+        <label className="add-card-name">
+          <span>Add Card</span>
+          <input
+            value={addCardName}
+            onChange={(event) => {
+              setAddCardName(event.target.value);
+              setIsSuggestionOpen(true);
+            }}
+            onFocus={() => setIsSuggestionOpen(true)}
+            onBlur={() => window.setTimeout(() => setIsSuggestionOpen(false), 120)}
+            onKeyDown={(event) => {
+              if (!showSuggestions || cardSuggestions.length === 0) return;
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                setActiveSuggestionIndex((current) => (current + 1) % cardSuggestions.length);
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                setActiveSuggestionIndex((current) => (current - 1 + cardSuggestions.length) % cardSuggestions.length);
+              } else if (event.key === "Enter") {
+                event.preventDefault();
+                chooseCardSuggestion(cardSuggestions[activeSuggestionIndex] ?? cardSuggestions[0]);
+              } else if (event.key === "Escape") {
+                setIsSuggestionOpen(false);
+              }
+            }}
+            placeholder="Card name"
+            role="combobox"
+            aria-autocomplete="list"
+            aria-expanded={showSuggestions}
+            aria-controls="add-card-suggestions"
+            aria-activedescendant={showSuggestions && cardSuggestions[activeSuggestionIndex] ? `add-card-suggestion-${activeSuggestionIndex}` : undefined}
+          />
+          {showSuggestions && (
+            <div className="add-card-suggestions" id="add-card-suggestions" role="listbox">
+              {isSearchingCards && <div className="add-card-suggestion-status">Searching Scryfall...</div>}
+              {cardSearchError && <div className="add-card-suggestion-status error">{cardSearchError}</div>}
+              {!isSearchingCards && !cardSearchError && cardSuggestions.length === 0 && trimmedAddCardName.length >= 2 && (
+                <div className="add-card-suggestion-status">No matching cards.</div>
+              )}
+              {cardSuggestions.map((name, index) => (
+                <button
+                  key={name}
+                  id={`add-card-suggestion-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === activeSuggestionIndex}
+                  className={index === activeSuggestionIndex ? "active" : undefined}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onMouseEnter={() => setActiveSuggestionIndex(index)}
+                  onClick={() => chooseCardSuggestion(name)}
+                >
+                  {name}
+                </button>
+              ))}
+            </div>
+          )}
+        </label>
+        <label className="add-card-quantity">
+          <span>Qty</span>
+          <input
+            type="number"
+            min="1"
+            max="999"
+            value={addCardQuantity}
+            onChange={(event) => setAddCardQuantity(Math.max(1, Number(event.target.value) || 1))}
+          />
+        </label>
+        <label>
+          <span>Board</span>
+          <select value={addCardBoard} onChange={(event) => setAddCardBoard(event.target.value as DeckBoard)}>
+            <option value="mainboard">Mainboard</option>
+            <option value="sideboard">Sideboard</option>
+          </select>
+        </label>
+        <button type="submit" className="primary-button" disabled={isAddingCard || !trimmedAddCardName}>
+          <Plus size={17} />
+          {isAddingCard ? "Adding..." : "Add"}
+        </button>
+        {addCardStatus && <p className="add-card-status">{addCardStatus}</p>}
+      </form>
       <div className="toolbar">
         <label className="search-box">
           <Search size={16} />
@@ -62,61 +247,63 @@ export function DeckGrid({
           {sortAscending ? <ArrowDownAZ size={17} /> : <ArrowUpAZ size={17} />}
         </button>
       </div>
-      <div className="deck-groups">
-        {groups.map((group) => {
-          const isCollapsed = collapsedCategories.has(group.category);
-          const count = group.entries.reduce((sum, entry) => sum + entry.quantity, 0);
-          return (
-            <div className="deck-category" key={group.category}>
-              <button
-                type="button"
-                className="category-heading collapsible-heading"
-                aria-expanded={!isCollapsed}
-                onClick={() => toggleSetItem(setCollapsedCategories, group.category)}
-              >
-                <span className="heading-title">
-                  {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
-                  <h2>{group.category}</h2>
-                </span>
-                <span>{count}</span>
-              </button>
-              {!isCollapsed && (
-                <div className="card-grid">
-                  {group.entries.map((entry) => (
-                    <DeckStackCard
-                      key={entry.id}
-                      entry={entry}
-                      isSelected={entry.id === selectedCardId}
-                      onSelect={() => onSelectCard(entry.id)}
-                    />
-                  ))}
-                </div>
-              )}
+      <div className="deck-board-stack">
+        {boards.map((boardGroup) => (
+          <section className="deck-board-section" key={boardGroup.board} aria-labelledby={`deck-board-${boardGroup.board}`}>
+            <div className="deck-board-heading">
+              <h2 id={`deck-board-${boardGroup.board}`}>{boardGroup.title}</h2>
+              <span>{boardGroup.count}</span>
             </div>
-          );
-        })}
+            <div className="deck-groups">
+              {boardGroup.groups.map((group) => {
+                const collapseKey = `${boardGroup.board}:${group.category}`;
+                const isCollapsed = collapsedCategories.has(collapseKey);
+                const count = group.entries.reduce((sum, entry) => sum + entry.quantity, 0);
+                return (
+                  <div className="deck-category" key={collapseKey}>
+                    <button
+                      type="button"
+                      className="category-heading collapsible-heading"
+                      aria-expanded={!isCollapsed}
+                      onClick={() => toggleSetItem(setCollapsedCategories, collapseKey)}
+                    >
+                      <span className="heading-title">
+                        {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
+                        <h3>{group.category}</h3>
+                      </span>
+                      <span>{count}</span>
+                    </button>
+                    {!isCollapsed && (
+                      <div className="card-grid">
+                        {group.entries.map((entry) => (
+                          <DeckStackCard
+                            key={entry.id}
+                            entry={entry}
+                            isSelected={entry.id === selectedCardId}
+                            isMenuOpen={openCardMenuId === entry.id}
+                            onSelect={() => onSelectCard(entry.id)}
+                            onToggleMenu={() => setOpenCardMenuId((current) => (current === entry.id ? undefined : entry.id))}
+                            onMoveToBoard={(board) => {
+                              onMoveCardToBoard(entry.id, board);
+                              setOpenCardMenuId(undefined);
+                            }}
+                            onDelete={() => {
+                              onDeleteCard(entry.id);
+                              setOpenCardMenuId(undefined);
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+        ))}
+        {boards.length === 0 && <div className="deck-grid-empty">No cards match the current controls.</div>}
       </div>
     </section>
-  );
-}
-
-function DeckStackCard({ entry, isSelected, onSelect }: { entry: DeckEntry; isSelected: boolean; onSelect: () => void }) {
-  const imageUri = getImageUri(entry);
-
-  return (
-    <button
-      type="button"
-      className={`deck-card ${isSelected ? "selected" : ""}`}
-      onClick={onSelect}
-      aria-label={`Open ${entry.name}`}
-    >
-      {imageUri ? (
-        <img className="deck-card-image" src={imageUri} alt={entry.name} loading="lazy" />
-      ) : (
-        <span className="deck-card-image missing-card-art">{entry.name}</span>
-      )}
-      {entry.quantity > 1 && <span className="card-qty" aria-label={`Quantity ${entry.quantity}`}>{entry.quantity}</span>}
-    </button>
   );
 }
 

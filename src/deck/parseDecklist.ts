@@ -1,4 +1,4 @@
-import { DeckEntry } from "./deckModel";
+import { DeckBoard, DeckEntry } from "./deckModel";
 
 export type ParsedDecklist = {
   entries: Omit<DeckEntry, "id" | "scryfall" | "unresolved">[];
@@ -7,12 +7,14 @@ export type ParsedDecklist = {
 };
 
 const COMMANDER_HEADINGS = new Set(["commander", "commanders"]);
-const IGNORED_HEADINGS = new Set(["sideboard", "maybeboard"]);
+const SIDEBOARD_HEADINGS = new Set(["sideboard", "sideboards"]);
+const IGNORED_HEADINGS = new Set(["maybeboard"]);
 
 export function parseDecklist(text: string): ParsedDecklist {
   const entries: ParsedDecklist["entries"] = [];
   const warnings: string[] = [];
   let currentSection: string | undefined;
+  let currentBoard: DeckBoard = "mainboard";
   let commanderName: string | undefined;
   let ignoring = false;
 
@@ -23,6 +25,7 @@ export function parseDecklist(text: string): ParsedDecklist {
     const heading = line.replace(/:$/, "").trim();
     if (!/^\d+\s+/.test(line) && /^[\w\s/]+:?$/.test(line)) {
       currentSection = heading;
+      currentBoard = SIDEBOARD_HEADINGS.has(heading.toLowerCase()) ? "sideboard" : "mainboard";
       ignoring = IGNORED_HEADINGS.has(heading.toLowerCase());
       return;
     }
@@ -37,7 +40,7 @@ export function parseDecklist(text: string): ParsedDecklist {
 
     const quantity = Number(match[1]);
     const name = cleanupCardName(match[2]);
-    entries.push({ name, quantity, section: currentSection });
+    entries.push({ name, quantity, board: currentBoard, section: currentSection });
 
     if (currentSection && COMMANDER_HEADINGS.has(currentSection.toLowerCase()) && !commanderName) {
       commanderName = name;

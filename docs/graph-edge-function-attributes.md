@@ -36,6 +36,8 @@ For AI-generated edges and edgeFunctions, set `connectionGroup` whenever a more 
 
 Use the fixed `kind` values as broad semantics, but do not treat them as the only visible categories.
 
+The same two card nodes may have more than one useful relationship. Preserve distinct relationships when they have different operational reasons by giving each one a different `connectionGroup`; if the edge shares `sourceId`, `targetId`, and `kind` with another edge, append a short relationship slug to the edge id.
+
 ## Edge Function Direction
 
 Selected card creates edges to matching cards:

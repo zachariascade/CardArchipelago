@@ -1,7 +1,7 @@
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,16 @@ const PORT = Number(process.env.MTG_ANALYSIS_PORT ?? 8787);
 const RUNNER = process.env.MTG_ANALYSIS_RUNNER ?? "scaffold";
 const CODEX_BIN = process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
 const CODEX_TIMEOUT_MS = Number(process.env.MTG_CODEX_TIMEOUT_MS ?? 120_000);
+const DEFAULT_CODEX_MODEL = process.env.MTG_CODEX_MODEL ?? "gpt-5.4";
+const DEFAULT_CODEX_REASONING_EFFORT = process.env.MTG_CODEX_REASONING_EFFORT ?? "low";
 const EDGE_FUNCTION_ATTRIBUTE_REFERENCE = loadEdgeFunctionAttributeReference();
+const COMPACT_EDGE_FUNCTION_ATTRIBUTE_REFERENCE = [
+  "Use selector.attributes for selected-card -> matching-card functions, or sourceSelector.attributes with targetId for matching-card -> selected-card/group functions.",
+  "Supported virtual paths: card.type_line_all, card.oracle_text_all, card.is_land, card.is_nonland, card.is_commander, card.mana_value.",
+  "Scryfall paths are also available directly, including type_line, oracle_text, keywords, colors, color_identity, cmc, produced_mana, and card_faces.*.oracle_text.",
+  "Supported ops: exists, equals, notEquals, contains, notContains, includes, notIncludes, >, >=, <, <=.",
+  "Selectors are AND-only across attributes; prefer a narrower function over an overbroad one.",
+].join("\n");
 
 const server = http.createServer(async (request, response) => {
   setCorsHeaders(response);
@@ -43,8 +52,8 @@ server.listen(PORT, "127.0.0.1", () => {
 });
 
 async function runCodexAnalysis(request) {
-  const { action, input } = request ?? {};
-  if (!["analyzeDeck", "analyzeCard", "analyzeCardGraph", "answerQuestion"].includes(action)) {
+  const { action, input, options } = request ?? {};
+  if (!["analyzeDeck", "analyzeCard", "analyzeDeckGraph", "analyzeCardGraph", "answerQuestion"].includes(action)) {
     throw new Error("Invalid action.");
   }
 
@@ -54,7 +63,11 @@ async function runCodexAnalysis(request) {
   }
 
   if (RUNNER === "codex") {
-    return runCodexExecAnalysis(action, input);
+    return runCodexExecAnalysis(action, input, options);
+  }
+
+  if (action === "analyzeDeckGraph") {
+    return makeDeckGraphPatch(deck, input.graph, input.prompt);
   }
 
   if (action === "analyzeCardGraph") {
@@ -74,64 +87,128 @@ async function runCodexAnalysis(request) {
   return makeDeckAnalysis(deck);
 }
 
-async function runCodexExecAnalysis(action, input) {
-  const prompt = buildCodexPrompt(action, input);
-  if (action === "analyzeCardGraph") {
-    console.log(
-      `Card graph prompt size for ${input?.cardId ?? "unknown"}: ${prompt.length.toLocaleString()} chars, ~${estimateTokens(prompt).toLocaleString()} tokens.`,
-    );
-  }
+async function runCodexExecAnalysis(action, input, options = {}) {
   const workDir = await mkdtemp(join(tmpdir(), "mtg-analysis-"));
   const outputPath = join(workDir, "analysis-result.json");
+  const codexModel = normalizeCodexModel(options.codexModel) ?? DEFAULT_CODEX_MODEL;
+  const codexReasoningEffort = normalizeCodexReasoningEffort(options.codexReasoningEffort) ?? DEFAULT_CODEX_REASONING_EFFORT;
 
   try {
-    await runCommand(
+    const promptRequest = await buildCodexPrompt(action, input, workDir);
+    const prompt = promptRequest.prompt;
+    const promptUsage = {
+      promptChars: prompt.length,
+      promptTokensEstimate: estimateTokens(prompt),
+      contextFileChars: promptRequest.contextFileChars ?? 0,
+      contextFileTokensEstimate: estimateTokensByChars(promptRequest.contextFileChars ?? 0),
+    };
+    if (action === "analyzeDeckGraph") {
+      console.log(
+        `Deck graph prompt size for ${input?.deck?.id ?? "unknown"}: ${promptUsage.promptChars.toLocaleString()} prompt chars + ${promptUsage.contextFileChars.toLocaleString()} context-file chars, ~${(promptUsage.promptTokensEstimate + promptUsage.contextFileTokensEstimate).toLocaleString()} input tokens.`,
+      );
+    }
+    if (action === "analyzeCardGraph") {
+      console.log(
+        `Card graph prompt size for ${input?.cardId ?? "unknown"}: ${promptUsage.promptChars.toLocaleString()} prompt chars + ${promptUsage.contextFileChars.toLocaleString()} context-file chars, ~${(promptUsage.promptTokensEstimate + promptUsage.contextFileTokensEstimate).toLocaleString()} input tokens.`,
+      );
+    }
+    const codexArgs = [
+      "exec",
+      "--ephemeral",
+      "--skip-git-repo-check",
+      "--sandbox",
+      "read-only",
+      "-c",
+      `model_reasoning_effort="${codexReasoningEffort}"`,
+      ...(codexModel ? ["--model", codexModel] : []),
+      "--output-last-message",
+      outputPath,
+      "-",
+    ];
+    console.log(
+      `Codex runner settings: model=${codexModel ?? "config default"}, reasoning_effort=${codexReasoningEffort}, timeout=${CODEX_TIMEOUT_MS}ms.`,
+    );
+    const commandResult = await runCommand(
       CODEX_BIN,
-      [
-        "exec",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
-        "--output-last-message",
-        outputPath,
-        "-",
-      ],
+      codexArgs,
       prompt,
       CODEX_TIMEOUT_MS,
+      workDir,
     );
 
     const raw = await readFile(outputPath, "utf8");
-    const parsed = parseCodexJson(raw);
-    return action === "analyzeCardGraph" ? normalizeGraphPatch(parsed, input) : normalizeAnalysisResult(parsed);
+    let parsed;
+    try {
+      parsed = parseCodexJson(raw);
+    } catch (error) {
+      if (action === "answerQuestion") {
+        return makeQuestionFallbackAnalysis(input.deck, input.question ?? "", raw, error);
+      }
+      throw error;
+    }
+    if (action === "analyzeDeckGraph" || action === "analyzeCardGraph") {
+      const reportedUsage = parseReportedTokenUsage(`${commandResult.stdout}\n${commandResult.stderr}`);
+      return normalizeGraphPatch(parsed, input, makeGraphPatchUsage(promptUsage, raw, reportedUsage));
+    }
+    return normalizeAnalysisResult(parsed);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
 }
 
 function estimateTokens(text) {
-  return Math.ceil(text.length / 4);
+  return estimateTokensByChars(text.length);
 }
 
-function buildCodexPrompt(action, input) {
-  const deck = compactDeck(input.deck);
-  const selectedCard = action === "analyzeCard" || action === "analyzeCardGraph" ? deck.entries.find((entry) => entry.id === input.cardId) : undefined;
-  if (action === "analyzeCardGraph") {
-    return buildCardGraphPatchPrompt(input, deck, selectedCard);
+function estimateTokensByChars(charCount) {
+  return Math.ceil(charCount / 4);
+}
+
+function normalizeCodexModel(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function normalizeCodexReasoningEffort(value) {
+  if (value === "low" || value === "medium" || value === "high") return value;
+  return undefined;
+}
+
+async function buildCodexPrompt(action, input, workDir) {
+  const deck = compactDeck(input.deck, { omitEntryId: action === "analyzeCardGraph" ? input.cardId : undefined });
+  const selectedCardDeck = action === "analyzeCard" || action === "analyzeCardGraph" ? compactDeck(input.deck).entries.find((entry) => entry.id === input.cardId) : undefined;
+  if (action === "analyzeDeckGraph") {
+    const contextFiles = await writeDeckGraphContextFiles(workDir, input, deck);
+    return {
+      prompt: buildDeckGraphPatchPrompt(input, deck, contextFiles.files),
+      contextFileChars: contextFiles.charCount,
+    };
   }
-  return `You are an MTG Commander synergy analyst for a local deck explorer app.
+  if (action === "analyzeCardGraph") {
+    const contextFiles = await writeCardGraphContextFiles(workDir, input, deck, selectedCardDeck);
+    return {
+      prompt: buildCardGraphPatchPrompt(input, deck, selectedCardDeck, contextFiles.files),
+      contextFileChars: contextFiles.charCount,
+    };
+  }
+  return {
+    prompt: `You are an MTG Commander synergy analyst for a local deck explorer app.
 
 Return ONLY a single JSON object. Do not wrap it in markdown. Do not include commentary outside JSON.
+The JSON must be syntactically valid: double-quote every string, separate every array element with a comma, never use trailing commas, and escape newlines inside string values.
 
 Your task is descriptive and evidence-backed:
 - Prioritize synergy discovery.
 - For deck analysis, explain the broad strategy, commander context, and support packages.
 - For card analysis, explain what the selected card does in this deck and what cards support it.
+- For answerQuestion, answer the user's specific question directly. Choose the best supported layout: a paragraph, card list, grouped card list, stats, charts, tabs, or any useful combination.
 - Do not make keep/cut or upgrade recommendations.
 - Use exact card ids from the provided deck.
 - Use query-backed components for objective groups.
 - Use explicit cardIds for semantic support groups.
 - Every nontrivial claim should have evidence.
+- The response is transient in the app and will not be saved; still return one complete AnalysisResult JSON object.
 - Evidence items may ONLY use: claim, cardIds, query, note.
 - Do not use evidence fields named detail, reason, sourceText, explanation, or cards.
 
@@ -173,25 +250,85 @@ Important: every item inside GroupedCardList.groups MUST include "type": "CardLi
 Important: if kind is "card-analysis", subjectCardId MUST equal the selected card id.
 
 Request action: ${action}
+User question: ${action === "answerQuestion" ? input.question ?? "" : ""}
 Selected card id: ${input.cardId ?? ""}
-Selected card: ${selectedCard ? JSON.stringify(selectedCard) : "none"}
+Selected card: ${selectedCardDeck ? JSON.stringify(selectedCardDeck) : "none"}
 Available query capabilities: ${JSON.stringify(input.availableQueries ?? [])}
 Deck snapshot:
 ${JSON.stringify(deck)}
 
-Return the JSON now.`;
+Return the JSON now.`,
+  };
 }
 
-function buildCardGraphPatchPrompt(input, deck, selectedCard) {
+async function writeDeckGraphContextFiles(workDir, input, deck) {
+  const graph = compactGraph(input.graph);
+  const graphSummary = compactGraphSummary(graph);
+  const nodeMap = compactGraphNodeMap(graph);
+  const files = {
+    deckSeedCards: "deck-seed-cards.jsonl",
+    graphNodeMap: "graph-node-map.json",
+    graphSummary: "graph-summary.json",
+  };
+  const fileContents = {
+    [files.deckSeedCards]: compactDeckSeedEntries(deck).map((entry) => JSON.stringify(entry)).join("\n"),
+    [files.graphNodeMap]: `${JSON.stringify(nodeMap ?? null, null, 2)}\n`,
+    [files.graphSummary]: `${JSON.stringify(graphSummary ?? null, null, 2)}\n`,
+  };
+  await Promise.all(Object.entries(fileContents).map(([fileName, content]) => writeFile(join(workDir, fileName), content, "utf8")));
+  console.log(`Deck graph context files for ${input?.deck?.id ?? "unknown"} written to temporary query directory: ${Object.values(files).join(", ")}.`);
+  return {
+    files,
+    charCount: Object.values(fileContents).reduce((total, content) => total + content.length, 0),
+  };
+}
+
+async function writeCardGraphContextFiles(workDir, input, deck, selectedCard) {
   const graph = compactGraph(input.graph);
   const relatedGraphContext = compactRelatedGraphContext(graph, input.cardId);
   const graphSummary = compactGraphSummary(graph);
+  const files = {
+    selectedCard: "selected-card.json",
+    deckCardPool: "deck-card-pool.jsonl",
+    relatedGraphContext: "related-graph-context.json",
+    graphSummary: "graph-summary.json",
+    edgeFunctionAttributeReference: "edge-function-attribute-reference.md",
+  };
+  const fileContents = {
+    [files.selectedCard]: `${JSON.stringify(selectedCard ?? null, null, 2)}\n`,
+    [files.deckCardPool]: compactCardGraphPool(deck, selectedCard).map((entry) => JSON.stringify(entry)).join("\n"),
+    [files.relatedGraphContext]: `${JSON.stringify(relatedGraphContext ?? null, null, 2)}\n`,
+    [files.graphSummary]: `${JSON.stringify(graphSummary ?? null, null, 2)}\n`,
+    [files.edgeFunctionAttributeReference]: COMPACT_EDGE_FUNCTION_ATTRIBUTE_REFERENCE,
+  };
+  await Promise.all([
+    ...Object.entries(fileContents).map(([fileName, content]) => writeFile(join(workDir, fileName), content, "utf8")),
+  ]);
+  console.log(
+    `Card graph context files for ${input?.cardId ?? "unknown"} written to temporary query directory: ${Object.values(files).join(", ")}.`,
+  );
+  return {
+    files,
+    charCount: Object.values(fileContents).reduce((total, content) => total + content.length, 0),
+  };
+}
+
+function buildCardGraphPatchPrompt(input, deck, selectedCard, contextFiles) {
   const customPrompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
   return `You are an MTG Commander synergy graph analyst for a local deck explorer app.
 
 Return ONLY a single JSON object. Do not wrap it in markdown. Do not include commentary outside JSON.
 
 Your task: generate a card-level graph patch for the selected card. This patch will be applied on top of an existing deck graph.
+
+The deck and graph context are available as files in your current working directory. Read them as needed instead of relying on the prompt for full context.
+
+Context files:
+- ${contextFiles.selectedCard}: compact gameplay-only JSON for the selected card.
+- ${contextFiles.deckCardPool}: compact gameplay-only JSONL for every other card in the deck, one card per line.
+- ${contextFiles.relatedGraphContext}: existing graph nodes/edges related to the selected card.
+- ${contextFiles.graphSummary}: counts and summaries for the current graph.
+- ${contextFiles.edgeFunctionAttributeReference}: supported edgeFunction selector paths and examples.
 
 Rules:
 - Analyze ONLY relationships created by the selected card's rules text and deck role.
@@ -202,12 +339,14 @@ Rules:
 - Do not generate edges for unrelated cards unless the selected card is source or target.
 - Use the related graph context to understand existing incoming/outgoing relationships before adding new ones.
 - Do not duplicate an existing related edge unless the new edge has a clearer kind, stronger evidence, or adds a missing directional counterpart.
+- The same two card nodes may have multiple meaningful relationships. Keep each distinct relationship when it has a different operational reason, and separate those visible categories with different connectionGroup values.
 - Prefer edgeFunctions over enumerating many similar edges when a rule applies to a class of cards.
 - Use sourceId + selector when the selected card creates edges to matching cards.
 - Use sourceSelector + targetId when matching cards create edges to the selected card.
 - Edge kind is a machine-readable semantic hint. It is not the user-facing category. Use connectionGroup as the expressive, user-facing relationship label whenever possible.
 - For AI-generated edges and edgeFunctions, set connectionGroup to a concise phrase that describes the actual relationship, not merely the edge kind. Prefer labels like "Doubles Damage", "Reanimation Targets", "Cannot Reanimate", "Cast From Graveyard", "Feeds Sacrifice", "Death Trigger Payoffs", "Protects Commander", or other deck-specific phrases supported by the selected card text.
 - Use the fixed kind values as suggestions for graph semantics: "enables" means turns on access/conditions/triggers, "pays_off" means rewards a class/action, "supports" means softer consistency/access, and so on. The visible connection category should usually come from connectionGroup.
+- When two edges share sourceId, targetId, and kind but express different relationships, give each edge a distinct connectionGroup and append a short slug to the edge id after the kind.
 - Use edgeFunctions for repeated custom relationships, with connectionGroup set to the same expressive label the user should see in the Connections panel.
 - EdgeFunction selectors must describe the smallest meaningful operational class, not the broadest technically true class.
 - Avoid overbroad selectors such as all Creatures, all Permanents, all Spells, all Artifacts, all graveyard cards, or all cards with a common word when only a narrower subset actually improves the selected card.
@@ -238,7 +377,6 @@ Rules:
 - For card nodes, use id format "card:<cardId>".
 - For new concept nodes, use id format "ai:<selectedCardId>:<short-slug>".
 - For new AI edges, use source "ai-enriched".
-- Do not use edge source "deterministic".
 - Keep edges high-signal. Usually 3-12 edges is enough.
 - Every edge should have evidence.
 - Do not recommend cuts or upgrades.
@@ -314,29 +452,142 @@ Required DeckGraphPatch shape:
 }
 
 Edge id format:
-Use "<sourceId>-><targetId>:<kind>".
+Use "<sourceId>-><targetId>:<kind>" for a single ungrouped relationship, or "<sourceId>-><targetId>:<kind>:<relationship-slug>" when connectionGroup distinguishes this relationship from another edge between the same nodes.
 
 Edge function id format:
 Use "fn:<selectedCardId>:<short-slug>".
 
 Edge function attribute query reference:
-${EDGE_FUNCTION_ATTRIBUTE_REFERENCE}
+Read ${contextFiles.edgeFunctionAttributeReference} before creating edgeFunctions.
 
 Selected card id: ${input.cardId}
 Selected card:
-${selectedCard ? JSON.stringify(selectedCard) : "none"}
+Read ${contextFiles.selectedCard}.
 
 Related graph context:
-${JSON.stringify(relatedGraphContext)}
+Read ${contextFiles.relatedGraphContext}.
 
 Custom user prompt:
 ${customPrompt || "(none)"}
 
 Existing graph summary:
-${JSON.stringify(graphSummary)}
+Read ${contextFiles.graphSummary}.
 
 Deck card pool:
-${JSON.stringify(deck)}
+Read/search ${contextFiles.deckCardPool}. This file intentionally omits the selected card to avoid duplicating ${contextFiles.selectedCard}.
+
+Return the DeckGraphPatch JSON now.`;
+}
+
+function buildDeckGraphPatchPrompt(input, deck, contextFiles) {
+  const customPrompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  return `You are an MTG Commander synergy graph analyst for a local deck explorer app.
+
+Return ONLY a single JSON object. Do not wrap it in markdown. Do not include commentary outside JSON.
+
+Your task: generate an initial deck-level graph patch. This patch seeds broad, obvious connection groups for the whole deck and can be deleted like any other AI patch.
+
+The deck and graph context are available as files in your current working directory. Read them as needed instead of relying on the prompt for full context.
+
+Context files:
+- ${contextFiles.deckSeedCards}: compact seed-pass JSONL for the deck, one card per line.
+- ${contextFiles.graphNodeMap}: existing graph node IDs and labels.
+- ${contextFiles.graphSummary}: counts and summaries for the current graph.
+
+Rules:
+- Generate deck-wide connection groups, not card-level deep dives.
+- This is a fast first pass. Prefer 3-6 obvious groups and 3-6 edgeFunctions.
+- Keep the current expressive group style. connectionGroup is the user-facing label and should describe what the AI found important.
+- Prefer concise deck-specific labels such as "Token Bodies as Fuel", "Death Trigger Payoffs", "Artifact Recursion", "Commander Protection", "Graveyard Setup", or better labels supported by this deck.
+- Use concept nodes for meaningful groups.
+- Do not enumerate card memberships as direct edges. Use edgeFunctions only.
+- Each group should usually have one edgeFunction with targetId set to the group node, kind "belongs_to", sourceSelector matching the card class, and connectionGroup set to the expressive group label.
+- Do not fully analyze every individual card. This is a seed patch, meant to be made more granular by later card-level passes.
+- Do not recommend cuts or upgrades.
+- Do not create rigid taxonomy labels just because they are available. Let the group labels follow the deck.
+- Avoid generic mana or color edges such as "land helps cast spell".
+- Use exact card ids and graph node ids from the provided deck/graph whenever referencing existing cards/nodes.
+- For card nodes, use id format "card:<cardId>".
+- For new concept nodes, use id format "ai:deck:<short-slug>".
+- Set edgesToUpsert to [].
+- Keep selectors high-signal. Use the smallest obvious predicate set that captures the group.
+- Every edgeFunction should have a customMessage that explains why matching cards belong.
+- If a custom prompt is provided, satisfy it while preserving the base rules above.
+- Edge kind is a machine-readable semantic hint. It is not the user-facing category. Prefer connectionGroup for every card-specific, group-specific, or user-provided category.
+- EdgeFunction selectors are AND-only. If a group needs OR logic, create a narrower group/function instead.
+
+Allowed node kind: "card" | "package" | "strategy" | "resource" | "risk"
+Allowed edge kind: "supports" | "enables" | "pays_off" | "protects" | "answers" | "depends_on" | "weak_to" | "belongs_to"
+Allowed strength: 1 | 2 | 3 | 4 | 5
+Supported selector paths:
+- "card.type_line_all"
+- "card.oracle_text_all"
+- "card.is_land"
+- "card.is_nonland"
+- "card.is_commander"
+- "card.mana_value"
+Supported selector ops:
+- "exists" | "equals" | "notEquals" | "contains" | "notContains" | "includes" | "notIncludes" | ">" | ">=" | "<" | "<="
+
+Required DeckGraphPatch shape:
+{
+  "id": string,
+  "deckId": "${deck.id}",
+  "nodesToUpsert": [
+    {
+      "id": string,
+      "kind": "card" | "package" | "strategy" | "resource" | "risk",
+      "label": string,
+      "summary": string,
+      "cardId"?: string,
+      "cardIds"?: string[],
+      "weight": number
+    }
+  ],
+  "edgesToUpsert": [],
+  "edgeFunctions": [
+    {
+      "id": string,
+      "targetId": string,
+      "kind": "belongs_to",
+      "sourceSelector": {
+        "attributes": [
+          {
+            "path": string,
+            "op": "exists" | "equals" | "notEquals" | "contains" | "notContains" | "includes" | "notIncludes" | ">" | ">=" | "<" | "<=",
+            "value"?: string | number | boolean | string[] | number[]
+          }
+        ]
+      },
+      "customMessage": string,
+      "strength": 1 | 2 | 3 | 4 | 5,
+      "connectionGroup"?: string
+    }
+  ],
+  "edgeIdsToRemove"?: [],
+  "notes": string[],
+  "generatedAt": ISO string,
+  "source": "ai"
+}
+
+Edge function id format:
+Use "fn:deck:<short-slug>".
+
+Examples:
+- A group node "ai:deck:token-bodies-as-fuel" can have an edgeFunction with targetId "ai:deck:token-bodies-as-fuel", kind "belongs_to", sourceSelector {"attributes":[{"path":"card.oracle_text_all","op":"contains","value":"token"}]}, and connectionGroup "Token Bodies as Fuel".
+- A group node "ai:deck:graveyard-as-resource" can match {"path":"card.oracle_text_all","op":"contains","value":"graveyard"}.
+
+Custom user prompt:
+${customPrompt || "(none)"}
+
+Existing graph:
+Read ${contextFiles.graphNodeMap}.
+
+Existing graph summary:
+Read ${contextFiles.graphSummary}.
+
+Deck card pool:
+Read/search ${contextFiles.deckSeedCards}.
 
 Return the DeckGraphPatch JSON now.`;
 }
@@ -354,39 +605,126 @@ function loadEdgeFunctionAttributeReference() {
   }
 }
 
-function compactDeck(deck) {
+function compactDeck(deck, options = {}) {
   return {
     id: deck.id,
-    name: deck.name,
     format: deck.format,
     commanderId: deck.commanderId,
-    entries: deck.entries.map((entry) => ({
-      id: entry.id,
-      name: entry.name,
-      quantity: entry.quantity,
-      isCommander: entry.id === deck.commanderId,
-      manaCost: entry.scryfall?.mana_cost,
-      manaValue: entry.scryfall?.cmc,
-      colors: entry.scryfall?.colors,
-      colorIdentity: entry.scryfall?.color_identity,
-      typeLine: entry.scryfall?.type_line ?? entry.scryfall?.card_faces?.map((face) => face.type_line).filter(Boolean).join(" // "),
-      oracleText: [entry.scryfall?.oracle_text, ...(entry.scryfall?.card_faces?.map((face) => face.oracle_text) ?? [])]
-        .filter(Boolean)
-        .join("\n"),
-      keywords: entry.scryfall?.keywords,
-      producedMana: entry.scryfall?.produced_mana,
-      faces: entry.scryfall?.card_faces?.map((face) => ({
-        name: face.name,
-        manaCost: face.mana_cost,
-        typeLine: face.type_line,
-        oracleText: face.oracle_text,
-        power: face.power,
-        toughness: face.toughness,
-        loyalty: face.loyalty,
-        defense: face.defense,
-      })),
-    })),
+    entries: deck.entries
+      .filter((entry) => entry.id !== options.omitEntryId)
+      .map((entry) => compactDeckEntry(entry, deck.commanderId)),
   };
+}
+
+function compactDeckEntry(entry, commanderId) {
+  const card = entry.scryfall;
+  const faces = card?.card_faces?.map((face) =>
+    compactObject({
+      name: face.name,
+      manaCost: face.mana_cost,
+      typeLine: face.type_line,
+      oracleText: face.oracle_text,
+      power: face.power,
+      toughness: face.toughness,
+      loyalty: face.loyalty,
+      defense: face.defense,
+    }),
+  );
+  const hasFaces = Boolean(faces?.length);
+  return compactObject({
+    id: entry.id,
+    name: entry.name,
+    quantity: entry.quantity,
+    section: entry.section,
+    isCommander: entry.id === commanderId || undefined,
+    unresolved: entry.unresolved || undefined,
+    manaCost: card?.mana_cost,
+    manaValue: card?.cmc,
+    colors: card?.colors,
+    colorIdentity: card?.color_identity,
+    typeLine: hasFaces ? undefined : card?.type_line,
+    oracleText: hasFaces ? undefined : card?.oracle_text,
+    power: card?.power,
+    toughness: card?.toughness,
+    loyalty: card?.loyalty,
+    defense: card?.defense,
+    keywords: card?.keywords,
+    producedMana: card?.produced_mana,
+    faces,
+  });
+}
+
+function compactDeckSeedEntries(deck) {
+  return deck.entries
+    .map((entry) => {
+      const typeLine = compactEntryTypeLine(entry);
+      const oracleText = truncateSeedText(compactEntryOracleText(entry), 320);
+      return compactObject({
+        id: entry.id,
+        name: entry.name,
+        quantity: entry.quantity,
+        isCommander: entry.id === deck.commanderId || undefined,
+        manaValue: entry.manaValue,
+        typeLine,
+        oracleText,
+        keywords: entry.keywords?.slice(0, 8),
+        producedMana: entry.producedMana,
+      });
+    })
+    .filter((entry) => entry.isCommander || !String(entry.typeLine ?? "").toLowerCase().includes("basic land") || Boolean(entry.oracleText))
+    .slice(0, 110);
+}
+
+function compactCardGraphPool(deck, selectedCard) {
+  return deck.entries
+    .filter((entry) => entry.id !== selectedCard?.id)
+    .filter((entry) => !isBasicLandPoolEntry(entry))
+    .map(compactCardGraphPoolEntry);
+}
+
+function compactCardGraphPoolEntry(entry) {
+  return compactObject({
+    id: entry.id,
+    name: entry.name,
+    quantity: entry.quantity,
+    isCommander: entry.isCommander || undefined,
+    manaValue: entry.manaValue,
+    typeLine: compactEntryTypeLine(entry),
+    oracleText: truncateSeedText(compactEntryOracleText(entry), 360),
+    keywords: entry.keywords?.slice(0, 8),
+    producedMana: entry.producedMana,
+  });
+}
+
+function isBasicLandPoolEntry(entry) {
+  const typeLine = String(compactEntryTypeLine(entry) ?? "").toLowerCase();
+  return typeLine.includes("basic") && typeLine.includes("land");
+}
+
+function compactEntryTypeLine(entry) {
+  if (!entry) return undefined;
+  return entry.typeLine ?? entry.faces?.map((face) => face.typeLine).filter(Boolean).join(" // ");
+}
+
+function compactEntryOracleText(entry) {
+  if (!entry) return undefined;
+  return entry.oracleText ?? entry.faces?.map((face) => face.oracleText).filter(Boolean).join(" // ");
+}
+
+function truncateSeedText(value, maxLength) {
+  if (!value) return undefined;
+  const singleLine = String(value).replace(/\s+/g, " ").trim();
+  return singleLine.length > maxLength ? `${singleLine.slice(0, maxLength - 3)}...` : singleLine;
+}
+
+function compactObject(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => {
+      if (item === undefined || item === null || item === false || item === "") return false;
+      if (Array.isArray(item) && item.length === 0) return false;
+      return true;
+    }),
+  );
 }
 
 function compactGraphSummary(graph) {
@@ -431,6 +769,21 @@ function compactGraph(graph) {
       cardIds: edge.cardIds,
       generatedByFunctionId: edge.generatedByFunctionId,
       connectionGroup: edge.connectionGroup,
+      ownerCardId: edge.ownerCardId,
+      ownerPatchId: edge.ownerPatchId,
+    })),
+  };
+}
+
+function compactGraphNodeMap(graph) {
+  if (!graph) return undefined;
+  return {
+    deckId: graph.deckId,
+    nodes: (graph.nodes ?? []).map((node) => ({
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      cardId: node.cardId,
     })),
   };
 }
@@ -441,7 +794,7 @@ function compactRelatedGraphContext(graph, cardId) {
   const nodesById = new Map((graph.nodes ?? []).map((node) => [node.id, node]));
   const relatedEdges = (graph.edges ?? [])
     .filter((edge) => edge.sourceId === selectedNodeId || edge.targetId === selectedNodeId || edge.cardIds?.includes(cardId))
-    .slice(0, 80);
+    .slice(0, 36);
   const relatedNodeIds = new Set([selectedNodeId]);
   relatedEdges.forEach((edge) => {
     relatedNodeIds.add(edge.sourceId);
@@ -460,6 +813,8 @@ function compactRelatedGraphContext(graph, cardId) {
     cardIds: edge.cardIds?.slice(0, 8),
     generatedByFunctionId: edge.generatedByFunctionId,
     connectionGroup: edge.connectionGroup,
+    ownerCardId: edge.ownerCardId,
+    ownerPatchId: edge.ownerPatchId,
   });
   const compactNode = (node) =>
     node
@@ -480,7 +835,7 @@ function compactRelatedGraphContext(graph, cardId) {
       .map((nodeId) => nodesById.get(nodeId))
       .map(compactNode)
       .filter(Boolean)
-      .slice(0, 60),
+      .slice(0, 32),
     incomingEdges: relatedEdges.filter((edge) => edge.targetId === selectedNodeId).map(compactEdge),
     outgoingEdges: relatedEdges.filter((edge) => edge.sourceId === selectedNodeId).map(compactEdge),
     otherRelatedEdges: relatedEdges.filter((edge) => edge.sourceId !== selectedNodeId && edge.targetId !== selectedNodeId).map(compactEdge),
@@ -514,28 +869,66 @@ function normalizeAnalysisResult(result) {
   };
 }
 
-function normalizeGraphPatch(result, input) {
+function makeGraphPatchUsage(promptUsage, rawOutput, reportedUsage) {
+  const outputChars = rawOutput.length;
+  const outputTokensEstimate = estimateTokens(rawOutput);
+  return {
+    promptChars: promptUsage.promptChars,
+    contextFileChars: promptUsage.contextFileChars,
+    outputChars,
+    promptTokensEstimate: promptUsage.promptTokensEstimate,
+    contextFileTokensEstimate: promptUsage.contextFileTokensEstimate,
+    outputTokensEstimate,
+    totalTokensEstimate: promptUsage.promptTokensEstimate + promptUsage.contextFileTokensEstimate + outputTokensEstimate,
+    ...reportedUsage,
+    note: reportedUsage.reportedTotalTokens
+      ? "Reported token usage was parsed from the Codex runner output."
+      : "Estimated locally as characters / 4 because the Codex runner did not return structured token usage.",
+  };
+}
+
+function parseReportedTokenUsage(output) {
+  const inputMatch = output.match(/(?:input|prompt)\s+tokens?\D+([\d,]+)/i);
+  const outputMatch = output.match(/(?:output|completion)\s+tokens?\D+([\d,]+)/i);
+  const totalMatch = output.match(/(?:total)\s+tokens?\D+([\d,]+)/i);
+  return compactObject({
+    reportedInputTokens: parseTokenNumber(inputMatch?.[1]),
+    reportedOutputTokens: parseTokenNumber(outputMatch?.[1]),
+    reportedTotalTokens: parseTokenNumber(totalMatch?.[1]),
+  });
+}
+
+function parseTokenNumber(value) {
+  if (!value) return undefined;
+  const parsed = Number(value.replaceAll(",", ""));
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function normalizeGraphPatch(result, input, usage) {
   const now = new Date().toISOString();
   const deckId = input?.deck?.id ?? result.deckId;
   const cardId = input?.cardId ?? result.cardId;
   return {
-    id: result.id ?? `patch_${cardId}_${Date.now()}`,
+    id: result.id ?? `patch_${cardId ?? deckId}_${Date.now()}`,
     deckId,
-    cardId,
+    ...(cardId ? { cardId } : {}),
     nodesToUpsert: (result.nodesToUpsert ?? []).map((node) => ({
       ...node,
       weight: Number(node.weight ?? 5),
     })),
-    edgesToUpsert: (result.edgesToUpsert ?? []).map((edge) => ({
-      ...edge,
-      source: "ai-enriched",
-      strength: clampPatchStrength(edge.strength),
-    })),
+    edgesToUpsert: (result.edgesToUpsert ?? []).map((edge) =>
+      normalizeEdgeId({
+        ...edge,
+        source: "ai-enriched",
+        strength: clampPatchStrength(edge.strength),
+      }),
+    ),
     edgeFunctions: (result.edgeFunctions ?? []).map((edgeFunction) => ({
       ...edgeFunction,
       strength: clampPatchStrength(edgeFunction.strength),
     })),
     edgeIdsToRemove: result.edgeIdsToRemove ?? [],
+    usage: result.usage ?? usage,
     notes: result.notes ?? [],
     generatedAt: result.generatedAt ?? now,
     source: "ai",
@@ -547,6 +940,27 @@ function clampPatchStrength(value) {
   if (numeric <= 1) return 1;
   if (numeric >= 5) return 5;
   return Math.round(numeric);
+}
+
+function normalizeEdgeId(edge) {
+  const baseId = makeEdgeId(edge.sourceId, edge.targetId, edge.kind);
+  if (edge.id !== baseId) return edge;
+  const discriminator = edge.connectionGroup ?? edge.generatedByFunctionId;
+  return discriminator ? { ...edge, id: makeEdgeId(edge.sourceId, edge.targetId, edge.kind, discriminator) } : edge;
+}
+
+function makeEdgeId(sourceId, targetId, kind, relationship) {
+  const relationshipSlug = relationship ? slugifyEdgeRelationship(relationship) : "";
+  return `${sourceId}->${targetId}:${kind}${relationshipSlug ? `:${relationshipSlug}` : ""}`;
+}
+
+function slugifyEdgeRelationship(value) {
+  return String(value)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
 }
 
 function normalizeLayoutNode(node) {
@@ -582,19 +996,23 @@ function normalizeLayoutNode(node) {
   return node;
 }
 
-function runCommand(command, args, stdin, timeoutMs) {
+function runCommand(command, args, stdin, timeoutMs, cwd = process.cwd()) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: process.cwd(),
+      cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
     let stderr = "";
+    let stdout = "";
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
       reject(new Error(`Codex runner timed out after ${timeoutMs}ms.`));
     }, timeoutMs);
 
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
     child.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
     });
@@ -604,7 +1022,7 @@ function runCommand(command, args, stdin, timeoutMs) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code === 0) resolve();
+      if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`Codex runner exited with ${code}. ${stderr.trim()}`));
     });
     child.stdin.end(stdin);
@@ -728,6 +1146,157 @@ function makeQuestionAnalysis(deck, question) {
     evidence: [{ claim: `The deck snapshot included ${deck.entries.length} unique entries.` }],
     createdAt: new Date().toISOString(),
     source: "codex-local",
+  };
+}
+
+function makeQuestionFallbackAnalysis(deck, question, raw, parseError) {
+  const answerBody = extractFallbackAnswerBody(raw);
+  const parseMessage = parseError instanceof Error ? parseError.message : "The response was not valid JSON.";
+  return {
+    id: makeId("local_question_fallback"),
+    kind: "freeform",
+    title: "AI Answer",
+    summary: question,
+    layout: {
+      type: "stack",
+      children: [
+        {
+          type: "NarrativePanel",
+          title: "Answer",
+          body:
+            answerBody ||
+            `The AI returned malformed structured JSON, so the app could not render cards or charts from it. Raw response excerpt: ${trimForPanel(stripCodeFence(raw), 1800)}`,
+        },
+        { type: "EvidenceList", title: "Evidence" },
+      ],
+    },
+    evidence: [
+      {
+        claim: "The app recovered from a malformed structured AI response and displayed a transient text answer instead.",
+        note: parseMessage,
+      },
+      { claim: `The deck snapshot included ${deck.entries.length} unique entries.` },
+    ],
+    createdAt: new Date().toISOString(),
+    source: "codex-local",
+  };
+}
+
+function extractFallbackAnswerBody(raw) {
+  const text = stripCodeFence(raw);
+  const bodyMatch = text.match(/"body"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (bodyMatch?.[1]) return decodeJsonString(bodyMatch[1]);
+  const summaryMatch = text.match(/"summary"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (summaryMatch?.[1]) return decodeJsonString(summaryMatch[1]);
+  if (!text.trim().startsWith("{")) return trimForPanel(text, 2400);
+  return undefined;
+}
+
+function decodeJsonString(value) {
+  try {
+    return JSON.parse(`"${value}"`);
+  } catch {
+    return value.replace(/\\"/g, "\"").replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+  }
+}
+
+function stripCodeFence(value) {
+  return String(value ?? "")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+}
+
+function trimForPanel(value, maxLength) {
+  const text = String(value ?? "").replace(/\s+\n/g, "\n").trim();
+  return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
+}
+
+function makeDeckGraphPatch(deck, graph, prompt) {
+  const now = Date.now();
+  const customPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const groups = [
+    {
+      id: "token-bodies-as-fuel",
+      kind: "strategy",
+      label: "Token Bodies as Fuel",
+      summary: "Cards that create or use tokens as material for the deck's engine.",
+      selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "token" }] },
+      test: (entry) => cardText(entry).includes("token"),
+    },
+    {
+      id: "death-and-sacrifice-engine",
+      kind: "package",
+      label: "Death and Sacrifice Engine",
+      summary: "Cards that sacrifice permanents, care about dying, or convert deaths into value.",
+      selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "sacrifice" }] },
+      test: (entry) => cardText(entry).includes("sacrifice") || cardText(entry).includes(" dies") || cardText(entry).includes("creature dies"),
+    },
+    {
+      id: "graveyard-as-resource",
+      kind: "resource",
+      label: "Graveyard as Resource",
+      summary: "Cards that stock, reuse, or care about graveyards.",
+      selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "graveyard" }] },
+      test: (entry) => cardText(entry).includes("graveyard") || cardText(entry).includes("mill ") || cardText(entry).includes("return target"),
+    },
+    {
+      id: "card-flow",
+      kind: "package",
+      label: "Card Flow",
+      summary: "Cards that draw, filter, investigate, recur, or otherwise keep resources moving.",
+      selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "draw " }] },
+      test: (entry) => cardText(entry).includes("draw ") || cardText(entry).includes("investigate") || cardText(entry).includes("scry ") || cardText(entry).includes("surveil"),
+    },
+    {
+      id: "protection-and-resilience",
+      kind: "package",
+      label: "Protection and Resilience",
+      summary: "Cards that keep important permanents alive or blunt removal.",
+      selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "indestructible" }] },
+      test: (entry) => {
+        const text = cardText(entry);
+        return text.includes("hexproof") || text.includes("indestructible") || text.includes("protection from") || text.includes("phase out");
+      },
+    },
+  ]
+    .map((group) => ({ ...group, cards: deck.entries.filter(group.test) }))
+    .filter((group) => group.cards.length >= 2);
+
+  const nodesToUpsert = groups.map((group) => ({
+    id: `ai:deck:${group.id}`,
+    kind: group.kind,
+    label: group.label,
+    summary: group.summary,
+    cardIds: group.cards.map((entry) => entry.id),
+    weight: Math.min(10, Math.max(4, group.cards.length)),
+  }));
+
+  const edgeFunctions = groups.map((group) => ({
+    id: `fn:deck:${group.id}`,
+    targetId: `ai:deck:${group.id}`,
+    kind: "belongs_to",
+    sourceSelector: group.selector,
+    customMessage: `This card belongs in the deck-level "${group.label}" connection group.`,
+    strength: clampPatchStrength(group.cards.length >= 8 ? 4 : 3),
+    connectionGroup: group.label,
+  }));
+
+  return {
+    id: `patch_${deck.id}_deck_${now}`,
+    deckId: deck.id,
+    nodesToUpsert,
+    edgesToUpsert: [],
+    edgeFunctions,
+    edgeIdsToRemove: [],
+    notes: [
+      "This deck-level graph patch came from the local endpoint scaffold. Start the server with MTG_ANALYSIS_RUNNER=codex for actual model-generated connection groups.",
+      ...groups.map((group) => `${group.label}: ${group.cards.length} card${group.cards.length === 1 ? "" : "s"} found.`),
+      ...(customPrompt ? [`Custom prompt considered: ${customPrompt}`] : []),
+    ],
+    generatedAt: new Date().toISOString(),
+    source: "ai",
   };
 }
 

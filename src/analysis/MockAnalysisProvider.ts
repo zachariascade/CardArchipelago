@@ -1,5 +1,5 @@
 import { DeckEntry, DeckSnapshot, getManaValue, getOracleText, getPrimaryTypeLine } from "../deck/deckModel";
-import { DeckGraphPatch, generateCardGraphPatch } from "../deck/deckGraph";
+import { DeckGraphPatch, generateCardGraphPatch, generateDeckGraphPatch } from "../deck/deckGraph";
 import {
   availableQueries,
   countQuery,
@@ -10,7 +10,7 @@ import {
   type DeckQuery,
 } from "../deck/deckQueries";
 import { AnalysisProvider } from "./AnalysisProvider";
-import { AnalysisResult, CardAnalysisInput, CardGraphAnalysisInput, DeckAnalysisInput, FreeformDeckQuestionInput } from "./analysisSchema";
+import { AnalysisResult, CardAnalysisInput, CardGraphAnalysisInput, DeckAnalysisInput, DeckGraphAnalysisInput, FreeformDeckQuestionInput } from "./analysisSchema";
 
 type SemanticBucket = {
   id: string;
@@ -314,6 +314,10 @@ export class MockAnalysisProvider implements AnalysisProvider {
 
   async analyzeCardGraph(input: CardGraphAnalysisInput): Promise<DeckGraphPatch> {
     return generateCardGraphPatch(input.deck, input.graph, input.cardId, input.prompt);
+  }
+
+  async analyzeDeckGraph(input: DeckGraphAnalysisInput): Promise<DeckGraphPatch> {
+    return generateDeckGraphPatch(input.deck, input.graph, input.prompt);
   }
 
   async answerQuestion(input: FreeformDeckQuestionInput): Promise<AnalysisResult> {

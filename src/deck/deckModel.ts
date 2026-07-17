@@ -1,4 +1,5 @@
 export type ManaColor = "W" | "U" | "B" | "R" | "G" | "C";
+export type DeckBoard = "mainboard" | "sideboard";
 
 export type ScryfallImageUris = {
   small?: string;
@@ -43,6 +44,7 @@ export type DeckEntry = {
   id: string;
   name: string;
   quantity: number;
+  board?: DeckBoard;
   section?: string;
   unresolved?: boolean;
   scryfall?: ScryfallCard;
@@ -113,6 +115,10 @@ export function getImageUri(entry: DeckEntry): string | undefined {
     entry.scryfall?.image_uris?.small ??
     entry.scryfall?.card_faces?.[0]?.image_uris?.small
   );
+}
+
+export function getEntryBoard(entry: DeckEntry): DeckBoard {
+  return entry.board ?? "mainboard";
 }
 
 export function categorizeEntry(entry: DeckEntry, deck: DeckSnapshot): DeckCategory {

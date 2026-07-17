@@ -1,8 +1,8 @@
 import { DeckEntry, DeckSnapshot, getManaValue, getOracleText, getPrimaryTypeLine } from "./deckModel";
 
 export type DeckGraphNodeKind = "card" | "package" | "strategy" | "resource" | "risk";
-export type DeckGraphVariant = "base" | "ai-enriched";
-export type DeckGraphEdgeSource = "deterministic" | "ai-enriched";
+export type DeckGraphVariant = "ai-enriched";
+export type DeckGraphEdgeSource = "ai-enriched";
 
 export type DeckGraphEdgeKind =
   | "supports"
@@ -35,6 +35,8 @@ export type DeckGraphEdge = {
   cardIds?: string[];
   generatedByFunctionId?: string;
   connectionGroup?: string;
+  ownerCardId?: string;
+  ownerPatchId?: string;
 };
 
 export type GraphCardSelector = {
@@ -86,14 +88,29 @@ export type DeckGraph = {
 export type DeckGraphPatch = {
   id: string;
   deckId: string;
-  cardId: string;
+  cardId?: string;
   nodesToUpsert: DeckGraphNode[];
   edgesToUpsert: DeckGraphEdge[];
   edgeFunctions?: GraphEdgeFunction[];
   edgeIdsToRemove?: string[];
+  usage?: DeckGraphPatchUsage;
   notes: string[];
   generatedAt: string;
   source: "ai";
+};
+
+export type DeckGraphPatchUsage = {
+  promptChars: number;
+  contextFileChars: number;
+  outputChars: number;
+  promptTokensEstimate: number;
+  contextFileTokensEstimate: number;
+  outputTokensEstimate: number;
+  totalTokensEstimate: number;
+  reportedInputTokens?: number;
+  reportedOutputTokens?: number;
+  reportedTotalTokens?: number;
+  note?: string;
 };
 
 type GraphRule = {
@@ -427,7 +444,6 @@ export function buildDeckGraph(deck: DeckSnapshot): DeckGraph {
     cardIds: [entry.id],
     weight: entry.id === deck.commanderId ? 8 : Math.max(2, Math.min(5, entry.quantity + 1)),
   }));
-  const edges: DeckGraphEdge[] = [];
   const matches = [...PACKAGE_RULES, ...STRATEGY_RULES, ...RESOURCE_RULES, ...RISK_RULES]
     .map((rule) => matchRule(rule, deck))
     .filter((match) => match.count > 0);
@@ -441,91 +457,91 @@ export function buildDeckGraph(deck: DeckSnapshot): DeckGraph {
       cardIds: match.cardIds,
       weight: Math.min(10, Math.max(4, match.count)),
     });
-
-    match.cardIds.forEach((cardId) => {
-      edges.push({
-        id: edgeId(cardNodeId(cardId), conceptNodeId(match.kind, match.id), "belongs_to"),
-        sourceId: cardNodeId(cardId),
-        targetId: conceptNodeId(match.kind, match.id),
-        kind: "belongs_to",
-        source: "deterministic",
-        strength: strengthFromCount(match.count),
-        evidence: `${getCardName(deck, cardId)} maps to ${match.label}.`,
-        cardIds: [cardId],
-      });
-    });
   });
-
-  addCommanderEdges(deck, matches, edges);
-  addPackageStrategyEdges(matches, edges);
-  addRiskEdges(matches, edges);
-
-  return {
-    deckId: deck.id,
-    variant: "base",
-    generatedAt: new Date().toISOString(),
-    procedureSummary: "Base graph generated from direct type-line, Oracle text, commander-language, package, resource, and risk rules.",
-    nodes,
-    edges: dedupeEdges(edges),
-  };
-}
-
-export function buildEnrichedDeckGraph(deck: DeckSnapshot): DeckGraph {
-  const baseGraph = buildDeckGraph(deck);
-  const nodes = [...baseGraph.nodes];
-  const edges = [...baseGraph.edges];
-  const profiles = createCardProfiles(deck);
-  const roleMatches = new Map<string, CardProfile[]>();
-
-  profiles.forEach((profile) => {
-    ENRICHED_ROLES.forEach((role) => {
-      if (!role.test(profile)) return;
-      profile.roles.add(role.id);
-      const matches = roleMatches.get(role.id) ?? [];
-      matches.push(profile);
-      roleMatches.set(role.id, matches);
-    });
-  });
-  addProfileRoleMatches(profiles, roleMatches, ["ramp", "card-draw", "protection"]);
-
-  ENRICHED_ROLES.forEach((role) => {
-    const matches = roleMatches.get(role.id) ?? [];
-    if (!matches.length) return;
-    const nodeId = conceptNodeId(role.kind, `enriched-${role.id}`);
-    upsertNode(nodes, {
-      id: nodeId,
-      kind: role.kind,
-      label: role.label,
-      summary: role.summary,
-      cardIds: matches.map((profile) => profile.entry.id),
-      weight: Math.min(12, Math.max(5, matches.reduce((sum, profile) => sum + profile.entry.quantity, 0))),
-    });
-    matches.forEach((profile) => {
-      edges.push({
-        id: edgeId(cardNodeId(profile.entry.id), nodeId, role.edgeKind),
-        sourceId: cardNodeId(profile.entry.id),
-        targetId: nodeId,
-        kind: role.edgeKind,
-        source: "deterministic",
-        strength: strengthFromCount(matches.length),
-        evidence: `${profile.entry.name} was classified as ${role.label} during the enriched graph pass.`,
-        cardIds: [profile.entry.id],
-      });
-    });
-  });
-
-  addEnrichedCommanderEdges(deck, profiles, edges);
-  addEnrichedCardPairEdges(profiles, edges);
-  addEnrichedRoleEdges(roleMatches, edges);
 
   return {
     deckId: deck.id,
     variant: "ai-enriched",
     generatedAt: new Date().toISOString(),
-    procedureSummary:
-      "Enriched graph starts from the base graph, profiles every card, assigns semantic roles, links cards to role nodes, and adds inferred card-to-card synergy, payoff, protection, and dependency edges.",
+    procedureSummary: "Graph nodes are generated from deck structure and card text. Relationships are added only by AI card graph analysis.",
     nodes,
-    edges: dedupeEdges(edges),
+    edges: [],
+  };
+}
+
+export function generateDeckGraphPatch(deck: DeckSnapshot, graph: DeckGraph, prompt?: string): DeckGraphPatch {
+  const nodesToUpsert: DeckGraphNode[] = [];
+  const edgeFunctions: GraphEdgeFunction[] = [];
+  const notes: string[] = [];
+  const baseMatches = [...PACKAGE_RULES, ...STRATEGY_RULES, ...RESOURCE_RULES, ...RISK_RULES]
+    .map((rule) => matchRule(rule, deck))
+    .filter((match) => match.count > 0);
+  const profiles = createCardProfiles(deck);
+
+  baseMatches.forEach((match) => {
+    const nodeId = conceptNodeId(match.kind, match.id);
+    upsertNode(nodesToUpsert, {
+      id: nodeId,
+      kind: match.kind,
+      label: match.label,
+      summary: match.summary,
+      cardIds: match.cardIds,
+      weight: Math.min(10, Math.max(4, match.count)),
+    });
+    const sourceSelector = selectorForDeckGraphRule(match.id);
+    if (sourceSelector) {
+      edgeFunctions.push({
+        id: `fn:deck:${match.id}`,
+        targetId: nodeId,
+        kind: "belongs_to",
+        sourceSelector,
+        customMessage: `This card belongs in the deck-level "${match.label}" connection group.`,
+        strength: strengthFromCount(match.count),
+        connectionGroup: match.label,
+      });
+    }
+    notes.push(`${match.label}: ${match.count} card${match.count === 1 ? "" : "s"} found.`);
+  });
+
+  ENRICHED_ROLES.forEach((role) => {
+    const matches = profiles.filter(role.test);
+    if (!matches.length) return;
+    const nodeId = roleConceptNodeId(role.kind, role.id);
+    upsertNode(nodesToUpsert, {
+      id: nodeId,
+      kind: role.kind,
+      label: role.label,
+      summary: role.summary,
+      cardIds: matches.map((profile) => profile.entry.id),
+      weight: Math.min(10, Math.max(4, matches.length)),
+    });
+    const sourceSelector = selectorForEnrichedRole(role.id);
+    if (sourceSelector) {
+      edgeFunctions.push({
+        id: `fn:deck:${role.id}`,
+        targetId: nodeId,
+        kind: "belongs_to",
+        sourceSelector,
+        customMessage: `This card belongs in the deck-level "${role.label}" connection group.`,
+        strength: strengthFromCount(matches.length),
+        connectionGroup: role.label,
+      });
+    }
+  });
+
+  const customPrompt = prompt?.trim();
+  if (customPrompt) notes.push(`Deck-level prompt considered: ${customPrompt}`);
+
+  return {
+    id: `patch_${deck.id}_deck_${Date.now()}`,
+    deckId: deck.id,
+    nodesToUpsert,
+    edgesToUpsert: [],
+    edgeFunctions: edgeFunctions.filter((edgeFunction) => !graph.edges.some((edge) => edge.generatedByFunctionId === edgeFunction.id)),
+    edgeIdsToRemove: [],
+    notes: notes.length ? notes : ["Deck-level pass did not find additional broad connection groups from the current heuristics."],
+    generatedAt: new Date().toISOString(),
+    source: "ai",
   };
 }
 
@@ -538,20 +554,103 @@ export function applyGraphPatches(graph: DeckGraph, patches: DeckGraphPatch[], d
   patches.forEach((patch) => {
     patch.nodesToUpsert.forEach((node) => upsertNode(nodes, node));
     patch.edgesToUpsert.forEach((edge) => {
-      if (removedEdgeIds.has(edge.id)) return;
-      edges.push(edge);
+      const normalizedEdge = withPatchOwnership(normalizeDeckGraphEdgeId(edge), patch);
+      if (removedEdgeIds.has(edge.id) || removedEdgeIds.has(normalizedEdge.id)) return;
+      edges.push(normalizedEdge);
     });
     expandGraphEdgeFunctions(deck, patch).forEach((edge) => {
-      if (removedEdgeIds.has(edge.id)) return;
-      edges.push(edge);
+      const normalizedEdge = withPatchOwnership(normalizeDeckGraphEdgeId(edge), patch);
+      if (removedEdgeIds.has(edge.id) || removedEdgeIds.has(normalizedEdge.id)) return;
+      edges.push(normalizedEdge);
     });
   });
 
   return {
     ...graph,
-    procedureSummary: `${graph.procedureSummary} Saved card-level AI graph patches are applied on top.`,
+    procedureSummary: `${graph.procedureSummary} Saved AI graph patches are applied on top.`,
     nodes,
     edges: dedupeEdges(edges),
+  };
+}
+
+function selectorForDeckGraphRule(ruleId: string): GraphCardSelector | undefined {
+  switch (ruleId) {
+    case "ramp":
+      return {
+        attributes: [
+          { path: "card.oracle_text_all", op: "contains", value: "add {" },
+          { path: "card.is_nonland", op: "equals", value: true },
+        ],
+      };
+    case "card-draw":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "draw " }] };
+    case "interaction":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "target" }] };
+    case "protection":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "indestructible" }] };
+    case "sacrifice":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "sacrifice" }] };
+    case "tokens":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "token" }] };
+    case "graveyard":
+    case "graveyard-resource":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "graveyard" }] };
+    case "artifacts":
+      return { attributes: [{ path: "card.type_line_all", op: "contains", value: "Artifact" }] };
+    case "spells":
+      return { attributes: [{ path: "card.type_line_all", op: "contains", value: "Instant" }] };
+    case "treasure":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "Treasure" }] };
+    case "life-total":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "life" }] };
+    case "board-wipes":
+      return { attributes: [{ path: "card.type_line_all", op: "contains", value: "Creature" }] };
+    case "graveyard-hate":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "graveyard" }] };
+    default:
+      return undefined;
+  }
+}
+
+function selectorForEnrichedRole(roleId: string): GraphCardSelector | undefined {
+  switch (roleId) {
+    case "token-producers":
+      return {
+        attributes: [
+          { path: "card.oracle_text_all", op: "contains", value: "create" },
+          { path: "card.oracle_text_all", op: "contains", value: "token" },
+        ],
+      };
+    case "token-payoffs":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "tokens you control" }] };
+    case "sacrifice-outlets":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "sacrifice" }] };
+    case "death-payoffs":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "dies" }] };
+    case "recursion":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "from your graveyard" }] };
+    case "graveyard-setup":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "mill" }] };
+    case "tutors-selection":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "search your library" }] };
+    case "board-wipes":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "destroy all" }] };
+    case "finishers":
+      return { attributes: [{ path: "card.mana_value", op: ">=", value: 6 }] };
+    case "mana-sinks":
+      return { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "{X}" }] };
+    case "commander-support":
+      return { attributes: [{ path: "card.is_commander", op: "equals", value: false }] };
+    default:
+      return undefined;
+  }
+}
+
+function withPatchOwnership(edge: DeckGraphEdge, patch: DeckGraphPatch): DeckGraphEdge {
+  return {
+    ...edge,
+    ownerCardId: edge.ownerCardId ?? patch.cardId,
+    ownerPatchId: edge.ownerPatchId ?? patch.id,
   };
 }
 
@@ -761,7 +860,7 @@ function expandGraphEdgeFunctions(deck: DeckSnapshot | undefined, patch: DeckGra
 
 function makeExpandedFunctionEdge(edgeFunction: GraphEdgeFunction, sourceId: string, targetId: string, cardIds: (string | undefined)[]): DeckGraphEdge {
   return {
-    id: edgeId(sourceId, targetId, edgeFunction.kind),
+    id: edgeId(sourceId, targetId, edgeFunction.kind, edgeFunction.connectionGroup ?? edgeFunction.id),
     sourceId,
     targetId,
     kind: edgeFunction.kind,
@@ -1047,7 +1146,7 @@ function addEnrichedCommanderEdges(deck: DeckSnapshot, profiles: CardProfile[], 
         sourceId: cardNodeId(profile.entry.id),
         targetId: cardNodeId(commander.entry.id),
         kind: profile.roles.has("protection") ? "protects" : "supports",
-        source: "deterministic",
+        source: "ai-enriched",
         strength: profile.roles.has("commander-support") ? 4 : 3,
         evidence: `${profile.entry.name} shares commander-relevant language with ${commander.entry.name}.`,
         cardIds: [profile.entry.id, commander.entry.id],
@@ -1087,7 +1186,7 @@ function addEnrichedRoleEdges(roleMatches: Map<string, CardProfile[]>, edges: De
       sourceId: roleConceptNodeId(sourceKind, sourceId),
       targetId: roleConceptNodeId(targetKind, targetId),
       kind,
-      source: "deterministic",
+      source: "ai-enriched",
       strength: 4,
       evidence,
       cardIds: [...(roleMatches.get(sourceId) ?? []), ...(roleMatches.get(targetId) ?? [])].map((profile) => profile.entry.id).slice(0, 12),
@@ -1131,7 +1230,7 @@ function connectProfileGroups(
           sourceId: cardNodeId(source.entry.id),
           targetId: cardNodeId(target.entry.id),
           kind,
-          source: "deterministic",
+          source: "ai-enriched",
           strength,
           evidence: `${source.entry.name} -> ${target.entry.name}: ${evidence}`,
           cardIds: [source.entry.id, target.entry.id],
@@ -1180,7 +1279,7 @@ function addCommanderEdges(deck: DeckSnapshot, matches: RuleMatch[], edges: Deck
         sourceId: conceptNodeId(match.kind, match.id),
         targetId: commanderNode,
         kind: "supports",
-        source: "deterministic",
+        source: "ai-enriched",
         strength: strengthFromCount(match.count),
         evidence: `${match.label} appears to support ${commander.name}'s text or type line.`,
         cardIds: match.cardIds.slice(0, 8),
@@ -1195,7 +1294,7 @@ function addCommanderEdges(deck: DeckSnapshot, matches: RuleMatch[], edges: Deck
       sourceId: riskId,
       targetId: commanderNode,
       kind: "depends_on",
-      source: "deterministic",
+      source: "ai-enriched",
       strength: strengthFromCount(similarCards.length),
       evidence: `${similarCards.length} cards appear to share key language with ${commander.name}.`,
       cardIds: similarCards.map((entry) => entry.id),
@@ -1212,7 +1311,7 @@ function addPackageStrategyEdges(matches: RuleMatch[], edges: DeckGraphEdge[]): 
       sourceId: conceptNodeId(sourceKind, sourceId),
       targetId: conceptNodeId(targetKind, targetId),
       kind,
-      source: "deterministic",
+      source: "ai-enriched",
       strength: 4,
       evidence,
     });
@@ -1233,7 +1332,7 @@ function addRiskEdges(matches: RuleMatch[], edges: DeckGraphEdge[]): void {
       sourceId: conceptNodeId("strategy", "tokens"),
       targetId: conceptNodeId("risk", "board-wipes"),
       kind: "weak_to",
-      source: "deterministic",
+      source: "ai-enriched",
       strength: 4,
       evidence: "Token plans tend to commit multiple permanents to the battlefield.",
     });
@@ -1244,7 +1343,7 @@ function addRiskEdges(matches: RuleMatch[], edges: DeckGraphEdge[]): void {
       sourceId: conceptNodeId("strategy", "graveyard"),
       targetId: conceptNodeId("risk", "graveyard-hate"),
       kind: "weak_to",
-      source: "deterministic",
+      source: "ai-enriched",
       strength: 5,
       evidence: "Graveyard plans can be disrupted by graveyard exile or replacement effects.",
     });
@@ -1278,8 +1377,10 @@ function strengthFromCount(count: number): 1 | 2 | 3 | 4 | 5 {
 function dedupeEdges(edges: DeckGraphEdge[]): DeckGraphEdge[] {
   const seen = new Set<string>();
   return edges.filter((edge) => {
-    if (seen.has(edge.id)) return false;
-    seen.add(edge.id);
+    const normalized = normalizeDeckGraphEdgeId(edge);
+    if (seen.has(normalized.id)) return false;
+    edge.id = normalized.id;
+    seen.add(normalized.id);
     return true;
   });
 }
@@ -1304,6 +1405,23 @@ function conceptNodeId(kind: DeckGraphNodeKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function edgeId(sourceId: string, targetId: string, kind: DeckGraphEdgeKind): string {
-  return `${sourceId}->${targetId}:${kind}`;
+export function normalizeDeckGraphEdgeId(edge: DeckGraphEdge): DeckGraphEdge {
+  const baseId = edgeId(edge.sourceId, edge.targetId, edge.kind);
+  if (edge.id !== baseId) return edge;
+  const discriminator = edge.connectionGroup ?? edge.generatedByFunctionId;
+  return discriminator ? { ...edge, id: edgeId(edge.sourceId, edge.targetId, edge.kind, discriminator) } : edge;
+}
+
+function edgeId(sourceId: string, targetId: string, kind: DeckGraphEdgeKind, relationship?: string): string {
+  const relationshipSlug = relationship ? slugifyEdgeRelationship(relationship) : "";
+  return `${sourceId}->${targetId}:${kind}${relationshipSlug ? `:${relationshipSlug}` : ""}`;
+}
+
+function slugifyEdgeRelationship(value: string): string {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
 }

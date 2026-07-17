@@ -1,18 +1,35 @@
 import { AnalysisResult } from "../analysis/analysisSchema";
-import { DeckGraphPatch, DeckGraphVariant } from "../deck/deckGraph";
-import { DeckSnapshot } from "../deck/deckModel";
+import { DeckGraphPatch } from "../deck/deckGraph";
+import { DeckSnapshot, getEntryBoard } from "../deck/deckModel";
 
 const STORAGE_KEY = "mtg-deck-explorer:v1";
 
 export type ProviderConfig = {
   mode: "mock" | "local";
   endpointUrl: string;
+  codexModel: string;
+  codexReasoningEffort: "low" | "medium" | "high";
 };
 
 export type StoredDeckGraphState = {
   selectedNodeId?: string;
   hiddenNodeIds?: string[];
-  variant?: DeckGraphVariant;
+};
+
+export type QuestionThreadMessage = {
+  id: string;
+  question: string;
+  response: AnalysisResult;
+  createdAt: string;
+};
+
+export type QuestionThread = {
+  id: string;
+  deckId: string;
+  title: string;
+  messages: QuestionThreadMessage[];
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type StoredAppState = {
@@ -21,6 +38,8 @@ export type StoredAppState = {
   analysesByDeckId: Record<string, AnalysisResult[]>;
   graphStateByDeckId: Record<string, StoredDeckGraphState>;
   graphPatchesByDeckId: Record<string, Record<string, DeckGraphPatch>>;
+  questionThreadsByDeckId: Record<string, QuestionThread[]>;
+  activeQuestionThreadIdByDeckId: Record<string, string | undefined>;
   deck?: DeckSnapshot;
   selectedCardId?: string;
   selectedGraphNodeId?: string;
@@ -33,10 +52,14 @@ export const defaultStoredState: StoredAppState = {
   analysesByDeckId: {},
   graphStateByDeckId: {},
   graphPatchesByDeckId: {},
+  questionThreadsByDeckId: {},
+  activeQuestionThreadIdByDeckId: {},
   analyses: [],
   providerConfig: {
     mode: "mock",
     endpointUrl: "http://localhost:8787/analyze",
+    codexModel: "gpt-5.4",
+    codexReasoningEffort: "low",
   },
 };
 
@@ -46,7 +69,8 @@ export function loadStoredState(): StoredAppState {
   try {
     const parsed = JSON.parse(raw) as Partial<StoredAppState>;
     const legacyDeck = parsed.deck;
-    const decks = parsed.decks?.length ? parsed.decks : legacyDeck ? [legacyDeck] : [];
+    const rawDecks = parsed.decks?.length ? parsed.decks : legacyDeck ? [legacyDeck] : [];
+    const decks = rawDecks.map(normalizeStoredDeck);
     const activeDeckId = parsed.activeDeckId ?? legacyDeck?.id ?? decks[0]?.id;
     const analysesByDeckId = {
       ...(legacyDeck && parsed.analyses?.length ? { [legacyDeck.id]: parsed.analyses } : {}),
@@ -60,6 +84,12 @@ export function loadStoredState(): StoredAppState {
       analysesByDeckId,
       graphStateByDeckId: parsed.graphStateByDeckId ?? {},
       graphPatchesByDeckId: parsed.graphPatchesByDeckId ?? {},
+      questionThreadsByDeckId: parsed.questionThreadsByDeckId ?? {},
+      activeQuestionThreadIdByDeckId: parsed.activeQuestionThreadIdByDeckId ?? {},
+      providerConfig: {
+        ...defaultStoredState.providerConfig,
+        ...(parsed.providerConfig ?? {}),
+      },
     };
   } catch {
     return defaultStoredState;
@@ -68,4 +98,14 @@ export function loadStoredState(): StoredAppState {
 
 export function saveStoredState(state: StoredAppState): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function normalizeStoredDeck(deck: DeckSnapshot): DeckSnapshot {
+  return {
+    ...deck,
+    entries: deck.entries.map((entry) => ({
+      ...entry,
+      board: getEntryBoard(entry),
+    })),
+  };
 }

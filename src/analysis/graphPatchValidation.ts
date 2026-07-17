@@ -3,7 +3,7 @@ import { DeckGraphPatch } from "../deck/deckGraph";
 
 const graphNodeKindSchema = z.enum(["card", "package", "strategy", "resource", "risk"]);
 const graphEdgeKindSchema = z.enum(["supports", "enables", "pays_off", "protects", "answers", "depends_on", "weak_to", "belongs_to"]);
-const graphEdgeSourceSchema = z.enum(["deterministic", "ai-enriched"]);
+const graphEdgeSourceSchema = z.literal("ai-enriched");
 
 const deckGraphNodeSchema = z.object({
   id: z.string(),
@@ -26,6 +26,8 @@ const deckGraphEdgeSchema = z.object({
   cardIds: z.array(z.string()).optional(),
   generatedByFunctionId: z.string().optional(),
   connectionGroup: z.string().optional(),
+  ownerCardId: z.string().optional(),
+  ownerPatchId: z.string().optional(),
 });
 
 const graphCardAttributePredicateSchema = z
@@ -54,14 +56,29 @@ const graphEdgeFunctionSchema = z.object({
   connectionGroup: z.string().optional(),
 });
 
+const deckGraphPatchUsageSchema = z.object({
+  promptChars: z.number(),
+  contextFileChars: z.number(),
+  outputChars: z.number(),
+  promptTokensEstimate: z.number(),
+  contextFileTokensEstimate: z.number(),
+  outputTokensEstimate: z.number(),
+  totalTokensEstimate: z.number(),
+  reportedInputTokens: z.number().optional(),
+  reportedOutputTokens: z.number().optional(),
+  reportedTotalTokens: z.number().optional(),
+  note: z.string().optional(),
+});
+
 export const deckGraphPatchSchema = z.object({
   id: z.string(),
   deckId: z.string(),
-  cardId: z.string(),
+  cardId: z.string().optional(),
   nodesToUpsert: z.array(deckGraphNodeSchema),
   edgesToUpsert: z.array(deckGraphEdgeSchema),
   edgeFunctions: z.array(graphEdgeFunctionSchema).optional(),
   edgeIdsToRemove: z.array(z.string()).optional(),
+  usage: deckGraphPatchUsageSchema.optional(),
   notes: z.array(z.string()),
   generatedAt: z.string(),
   source: z.literal("ai"),

@@ -27,6 +27,13 @@ export type CardGraphAnalysisInput = {
   prompt?: string;
 };
 
+export type DeckGraphAnalysisInput = {
+  deck: DeckSnapshot;
+  graph: DeckGraph;
+  availableQueries: DeckQueryCapability[];
+  prompt?: string;
+};
+
 export type FreeformDeckQuestionInput = {
   deck: DeckSnapshot;
   question: string;

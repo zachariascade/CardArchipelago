@@ -1,20 +1,19 @@
 import { Fragment, useMemo, useState } from "react";
-import type { PointerEvent, ReactNode, WheelEvent } from "react";
-import { Brain, ChevronDown, Eye, EyeOff, Minus, RefreshCw, RotateCcw, Trash2, ZoomIn } from "lucide-react";
+import type { PointerEvent, ReactNode } from "react";
+import { Brain, Eye, EyeOff, Minus, RotateCcw, ZoomIn } from "lucide-react";
 import { AnalysisResult } from "../../analysis/analysisSchema";
 import { getCardById } from "../../deck/deckQueries";
 import { DeckSnapshot, getImageUri, getPrimaryTypeLine } from "../../deck/deckModel";
 import {
   DeckGraph,
   DeckGraphEdge,
-  DeckGraphEdgeSource,
   DeckGraphNode,
   DeckGraphNodeKind,
-  DeckGraphVariant,
   describeGraphNode,
   getConnectedGraphItems,
 } from "../../deck/deckGraph";
 import type { HoverPreviewHandlers } from "../../app/App";
+import { GraphConnections } from "./GraphConnections";
 
 type PositionedNode = DeckGraphNode & {
   x: number;
@@ -42,10 +41,6 @@ type CardNodeStyle = {
   segments: CardTypeSegment[];
   gradientId?: string;
 };
-
-type EdgeSourceMode = "all" | DeckGraphEdgeSource;
-
-const CONNECTION_KIND_ORDER: DeckGraphEdge["kind"][] = ["enables", "pays_off", "supports", "protects", "answers", "depends_on", "weak_to", "belongs_to"];
 
 const GRAPH_WORLD_WIDTH = 2000;
 const GRAPH_WORLD_HEIGHT = 1333;
@@ -102,18 +97,19 @@ export function DeckGraphView({
   hiddenNodeIds,
   isAnalyzing,
   latestAnalysis,
-  graphVariant,
   title,
   className,
-  showVariantControls = true,
   showFocusToggle = true,
+  connectionsPlacement = "inspector",
   onSelectNode,
-  onGraphVariantChange,
   onOpenCard,
   onAnalyzeNode,
   onPromptAnalyzeNode,
   onHideNode,
   onDeleteEdge,
+  onDeleteEdges,
+  onCopyConnectionsJson,
+  onDeleteConnectionsPatch,
   onResetHiddenNodes,
   hoverPreview,
   toolbarActions,
@@ -124,18 +120,19 @@ export function DeckGraphView({
   hiddenNodeIds: string[];
   isAnalyzing: boolean;
   latestAnalysis?: AnalysisResult;
-  graphVariant?: DeckGraphVariant;
   title?: string;
   className?: string;
-  showVariantControls?: boolean;
   showFocusToggle?: boolean;
+  connectionsPlacement?: "inspector" | "below-graph";
   onSelectNode: (nodeId: string) => void;
-  onGraphVariantChange?: (variant: DeckGraphVariant) => void;
   onOpenCard: (cardId: string) => void;
   onAnalyzeNode?: (nodeId: string) => void;
   onPromptAnalyzeNode?: (nodeId: string, prompt: string) => void;
   onHideNode?: (nodeId: string) => void;
   onDeleteEdge?: (edgeId: string) => void;
+  onDeleteEdges?: (edgeIds: string[], label?: string) => void;
+  onCopyConnectionsJson?: () => void;
+  onDeleteConnectionsPatch?: () => void;
   onResetHiddenNodes?: () => void;
   hoverPreview?: HoverPreviewHandlers;
   toolbarActions?: ReactNode;
@@ -145,28 +142,23 @@ export function DeckGraphView({
   const [pan, setPan] = useState<PanState>({ x: 0, y: 0 });
   const [dragState, setDragState] = useState<DragState>();
   const [focusSelectedOnly, setFocusSelectedOnly] = useState(false);
-  const [edgeSourceMode, setEdgeSourceMode] = useState<EdgeSourceMode>("ai-enriched");
   const [analysisPrompt, setAnalysisPrompt] = useState("");
   const baseVisibleGraph = useMemo(() => getVisibleGraph(graph, new Set(hiddenNodeIds)), [graph, hiddenNodeIds]);
-  const edgeFilteredGraph = useMemo(
-    () => filterGraphByEdgeSource(baseVisibleGraph, edgeSourceMode, selectedNodeId),
-    [baseVisibleGraph, edgeSourceMode, selectedNodeId],
-  );
   const selectedNeighborhood = useMemo(() => {
     if (!selectedNodeId) return undefined;
     const connectedNodeIds = new Set<string>([selectedNodeId]);
     const connectedEdgeIds = new Set<string>();
-    edgeFilteredGraph.edges.forEach((edge) => {
+    baseVisibleGraph.edges.forEach((edge) => {
       if (edge.sourceId !== selectedNodeId && edge.targetId !== selectedNodeId) return;
       connectedEdgeIds.add(edge.id);
       connectedNodeIds.add(edge.sourceId);
       connectedNodeIds.add(edge.targetId);
     });
     return { connectedNodeIds, connectedEdgeIds };
-  }, [selectedNodeId, edgeFilteredGraph.edges]);
+  }, [selectedNodeId, baseVisibleGraph.edges]);
   const visibleGraph = useMemo(
-    () => (focusSelectedOnly && selectedNeighborhood ? filterGraphToNodeIds(edgeFilteredGraph, selectedNeighborhood.connectedNodeIds) : edgeFilteredGraph),
-    [edgeFilteredGraph, focusSelectedOnly, selectedNeighborhood],
+    () => (focusSelectedOnly && selectedNeighborhood ? filterGraphToNodeIds(baseVisibleGraph, selectedNeighborhood.connectedNodeIds) : baseVisibleGraph),
+    [baseVisibleGraph, focusSelectedOnly, selectedNeighborhood],
   );
   const nodes = useMemo(
     () => layoutNodes(visibleGraph.nodes, visibleGraph.edges, spacing),
@@ -181,16 +173,21 @@ export function DeckGraphView({
     .map((node) => ({ node, style: cardNodeStyles.get(node.id) }))
     .filter((item): item is { node: PositionedNode; style: CardNodeStyle } => Boolean(item.style?.gradientId));
   const viewBox = getZoomedViewBox(zoom, pan);
-
-  function resetViewport() {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-  }
-
-  function handleGraphWheel(event: WheelEvent<SVGSVGElement>) {
-    event.preventDefault();
-    setZoom((value) => clampZoom(value + (event.deltaY < 0 ? 0.12 : -0.12)));
-  }
+  const selectedConnectionsPanel = selectedNode ? (
+    <GraphConnections
+      deck={deck}
+      nodes={selectedConnections.nodes}
+      edges={selectedConnections.edges}
+      selectedNodeId={selectedNode.id}
+      onSelectNode={onSelectNode}
+      onOpenCard={onOpenCard}
+      onDeleteEdge={onDeleteEdge}
+      onDeleteEdges={onDeleteEdges}
+      onCopyConnectionsJson={onCopyConnectionsJson}
+      onDeleteConnectionsPatch={onDeleteConnectionsPatch}
+      hoverPreview={hoverPreview}
+    />
+  ) : null;
 
   function handleGraphPointerDown(event: PointerEvent<SVGSVGElement>) {
     if (event.target !== event.currentTarget) return;
@@ -219,10 +216,10 @@ export function DeckGraphView({
   }
 
   return (
-    <section className={`graph-workspace ${className ?? ""}`}>
+    <section className={`graph-workspace ${connectionsPlacement === "below-graph" ? "graph-workspace-connections-below" : ""} ${className ?? ""}`}>
       <div className="graph-toolbar">
         <div>
-          <h2>{title ?? (graph.variant === "ai-enriched" ? "AI Enriched Graph" : "Base Graph")}</h2>
+          <h2>{title ?? "Graph"}</h2>
           <p>
             {visibleGraph.nodes.length} of {graph.nodes.length} nodes and {visibleGraph.edges.length} of {graph.edges.length} relationships.
             {" "}
@@ -230,44 +227,12 @@ export function DeckGraphView({
           </p>
         </div>
         <div className="panel-actions">
-          {showVariantControls && graphVariant && onGraphVariantChange && (
-            <div className="segmented-control" aria-label="Graph generation mode">
-              <button type="button" className={graphVariant === "base" ? "active" : ""} onClick={() => onGraphVariantChange("base")}>
-                Base
-              </button>
-              <button type="button" className={graphVariant === "ai-enriched" ? "active" : ""} onClick={() => onGraphVariantChange("ai-enriched")}>
-                AI Enriched
-              </button>
-            </div>
-          )}
           {showFocusToggle && selectedNode && (
             <button type="button" className="secondary-button" onClick={() => setFocusSelectedOnly((value) => !value)}>
               {focusSelectedOnly ? <Eye size={16} /> : <EyeOff size={16} />}
               {focusSelectedOnly ? "Show All" : "Focus"}
             </button>
           )}
-          <div className="segmented-control" aria-label="Graph edge source">
-            <button type="button" className={edgeSourceMode === "all" ? "active" : ""} onClick={() => setEdgeSourceMode("all")}>
-              All Edges
-            </button>
-            <button type="button" className={edgeSourceMode === "deterministic" ? "active" : ""} onClick={() => setEdgeSourceMode("deterministic")}>
-              Deterministic
-            </button>
-            <button type="button" className={edgeSourceMode === "ai-enriched" ? "active" : ""} onClick={() => setEdgeSourceMode("ai-enriched")}>
-              AI
-            </button>
-          </div>
-          <div className="graph-zoom-controls" aria-label="Graph zoom controls">
-            <button type="button" className="icon-button" onClick={() => setZoom((value) => clampZoom(value - 0.15))} disabled={zoom <= 0.7} title="Zoom out">
-              <Minus size={16} />
-            </button>
-            <button type="button" className="secondary-button compact-button" onClick={resetViewport} disabled={zoom === 1 && pan.x === 0 && pan.y === 0}>
-              {Math.round(zoom * 100)}%
-            </button>
-            <button type="button" className="icon-button" onClick={() => setZoom((value) => clampZoom(value + 0.15))} disabled={zoom >= 3} title="Zoom in">
-              <ZoomIn size={16} />
-            </button>
-          </div>
           <label className="graph-spacing-control">
             <span>Spacing {spacing.toFixed(1)}x</span>
             <input type="range" min="0.8" max="4" step="0.1" value={spacing} onChange={(event) => setSpacing(Number(event.target.value))} />
@@ -284,12 +249,22 @@ export function DeckGraphView({
 
       <div className="graph-layout">
         <div className="graph-canvas-panel">
+          <div className="graph-zoom-controls graph-zoom-overlay" aria-label="Graph zoom controls">
+            <button type="button" className="icon-button" onClick={() => setZoom((value) => clampZoom(value - 0.15))} disabled={zoom <= 0.7} aria-label="Zoom out" title="Zoom out">
+              <Minus size={16} />
+            </button>
+            <span className="graph-zoom-readout" aria-label={`Zoom ${Math.round(zoom * 100)} percent`}>
+              {Math.round(zoom * 100)}%
+            </span>
+            <button type="button" className="icon-button" onClick={() => setZoom((value) => clampZoom(value + 0.15))} disabled={zoom >= 3} aria-label="Zoom in" title="Zoom in">
+              <ZoomIn size={16} />
+            </button>
+          </div>
           <svg
             className={`deck-graph-svg ${dragState ? "is-panning" : ""}`}
             viewBox={viewBox}
             role="img"
             aria-label="Deck strategy network graph"
-            onWheel={handleGraphWheel}
             onPointerDown={handleGraphPointerDown}
             onPointerMove={handleGraphPointerMove}
             onPointerUp={handleGraphPointerUp}
@@ -437,16 +412,7 @@ export function DeckGraphView({
                 </div>
               )}
 
-              <GraphConnections
-                deck={deck}
-                nodes={selectedConnections.nodes}
-                edges={selectedConnections.edges}
-                selectedNodeId={selectedNode.id}
-                onSelectNode={onSelectNode}
-                onOpenCard={onOpenCard}
-                onDeleteEdge={onDeleteEdge}
-                hoverPreview={hoverPreview}
-              />
+              {connectionsPlacement === "inspector" && selectedConnectionsPanel}
 
               {latestAnalysis && (
                 <div className="graph-analysis-note">
@@ -461,6 +427,12 @@ export function DeckGraphView({
           )}
         </aside>
       </div>
+
+      {connectionsPlacement === "below-graph" && (
+        <section className="graph-connections-panel">
+          {selectedConnectionsPanel ?? <div className="analysis-empty-state">No graph node is selected.</div>}
+        </section>
+      )}
     </section>
   );
 }
@@ -477,168 +449,6 @@ function GraphCardPreview({ deck, cardId, onOpenCard }: { deck: DeckSnapshot; ca
       </div>
     </button>
   );
-}
-
-function GraphConnections({
-  deck,
-  nodes,
-  edges,
-  selectedNodeId,
-  onSelectNode,
-  onOpenCard,
-  onDeleteEdge,
-  hoverPreview,
-}: {
-  deck: DeckSnapshot;
-  nodes: DeckGraphNode[];
-  edges: DeckGraphEdge[];
-  selectedNodeId: string;
-  onSelectNode: (nodeId: string) => void;
-  onOpenCard: (cardId: string) => void;
-  onDeleteEdge?: (edgeId: string) => void;
-  hoverPreview?: HoverPreviewHandlers;
-}) {
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(() => new Set());
-  if (!nodes.length) {
-    return (
-      <div className="graph-connections">
-        <h3>Connections</h3>
-        <div className="graph-connections-empty">No visible connections.</div>
-      </div>
-    );
-  }
-  const nodeById = new Map(nodes.map((node) => [node.id, node]));
-  const groups = groupConnections(edges, nodeById, selectedNodeId);
-  function toggleGroup(kind: string) {
-    setCollapsedGroups((current) => {
-      const next = new Set(current);
-      if (next.has(kind)) next.delete(kind);
-      else next.add(kind);
-      return next;
-    });
-  }
-  return (
-    <div className="graph-connections">
-      <h3>Connections</h3>
-      {groups.map((group) => {
-        const collapsed = collapsedGroups.has(group.id);
-        return (
-          <div className={`graph-connection-group ${collapsed ? "collapsed" : ""}`} key={group.id}>
-            <button
-              type="button"
-              className="graph-connection-group-heading"
-              onClick={() => toggleGroup(group.id)}
-              aria-expanded={!collapsed}
-              aria-controls={`graph-connection-group-${selectedNodeId}-${group.id}`}
-            >
-              <span>
-                <ChevronDown size={14} />
-                {group.label}
-              </span>
-              <strong>{group.items.length}</strong>
-            </button>
-            {!collapsed && (
-              <div id={`graph-connection-group-${selectedNodeId}-${group.id}`} className="graph-connection-group-items">
-                {group.items.slice(0, 18).map(({ node, edge }) => {
-            const connectionText = edgeLabel(edge, selectedNodeId, node.id);
-            return (
-              <div
-                key={`${edge.id}:${node.id}`}
-                className="graph-connection-row"
-                role="button"
-                tabIndex={0}
-                onClick={() => (node.cardId ? onOpenCard(node.cardId) : onSelectNode(node.id))}
-                onKeyDown={(event) => {
-                  if (event.key !== "Enter" && event.key !== " ") return;
-                  event.preventDefault();
-                  node.cardId ? onOpenCard(node.cardId) : onSelectNode(node.id);
-                }}
-                onMouseEnter={(event) => node.cardId && hoverPreview?.show(node.cardId, event.currentTarget)}
-                onMouseLeave={hoverPreview?.hide}
-                onFocus={(event) => node.cardId && hoverPreview?.show(node.cardId, event.currentTarget)}
-                onBlur={hoverPreview?.hide}
-                aria-label={`${node.label}. ${connectionText}`}
-              >
-                <span className={`connection-kind ${node.kind}`}>{node.kind}</span>
-                <strong>{node.label}</strong>
-                <em>{connectionText}</em>
-                {onDeleteEdge && (
-                  <button
-                    type="button"
-                    className="graph-edge-delete-button"
-                    title="Delete edge"
-                    aria-label={`Delete edge between selected node and ${node.label}`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onDeleteEdge(edge.id);
-                    }}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                )}
-                <span className="connection-tooltip" role="tooltip">
-                  {connectionText}
-                </span>
-              </div>
-            );
-                })}
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-function groupConnections(
-  edges: DeckGraphEdge[],
-  nodeById: Map<string, DeckGraphNode>,
-  selectedNodeId: string,
-): { id: string; label: string; kind?: DeckGraphEdge["kind"]; items: { node: DeckGraphNode; edge: DeckGraphEdge }[] }[] {
-  const groups = new Map<string, { label: string; kind?: DeckGraphEdge["kind"]; items: { node: DeckGraphNode; edge: DeckGraphEdge }[] }>();
-  edges.forEach((edge) => {
-    const otherNodeId = edge.sourceId === selectedNodeId ? edge.targetId : edge.targetId === selectedNodeId ? edge.sourceId : undefined;
-    if (!otherNodeId) return;
-    const node = nodeById.get(otherNodeId);
-    if (!node) return;
-    const customLabel = edge.connectionGroup?.trim();
-    const groupId = customLabel ? `custom:${customLabel.toLowerCase()}` : `kind:${edge.kind}`;
-    const group = groups.get(groupId) ?? {
-      label: customLabel || connectionKindLabel(edge.kind),
-      kind: customLabel ? undefined : edge.kind,
-      items: [],
-    };
-    group.items.push({ node, edge });
-    groups.set(groupId, group);
-  });
-  return Array.from(groups.entries())
-    .map(([id, group]) => ({
-      id,
-      label: group.label,
-      kind: group.kind,
-      items: group.items.sort((a, b) => b.edge.strength - a.edge.strength || a.node.label.localeCompare(b.node.label)),
-    }))
-    .sort((a, b) => groupSortIndex(a.kind) - groupSortIndex(b.kind) || a.label.localeCompare(b.label));
-}
-
-function groupSortIndex(kind?: DeckGraphEdge["kind"]): number {
-  if (!kind) return -1;
-  return CONNECTION_KIND_ORDER.indexOf(kind);
-}
-
-function connectionKindLabel(kind: DeckGraphEdge["kind"]): string {
-  const labels: Record<DeckGraphEdge["kind"], string> = {
-    supports: "Supports",
-    enables: "Enables",
-    pays_off: "Pays Off",
-    protects: "Protects",
-    answers: "Answers",
-    depends_on: "Depends On",
-    weak_to: "Weak To",
-    belongs_to: "Belongs To",
-  };
-  return labels[kind];
 }
 
 function getCardNodeStyles(deck: DeckSnapshot, nodes: PositionedNode[]): Map<string, CardNodeStyle> {
@@ -855,18 +665,6 @@ function filterGraphToNodeIds(graph: DeckGraph, nodeIds: Set<string>): DeckGraph
   };
 }
 
-function filterGraphByEdgeSource(graph: DeckGraph, edgeSourceMode: EdgeSourceMode, selectedNodeId?: string): DeckGraph {
-  if (edgeSourceMode === "all") return graph;
-  const edges = graph.edges.filter((edge) => edge.source === edgeSourceMode);
-  const nodeIds = new Set(edges.flatMap((edge) => [edge.sourceId, edge.targetId]));
-  if (selectedNodeId) nodeIds.add(selectedNodeId);
-  return {
-    ...graph,
-    nodes: graph.nodes.filter((node) => nodeIds.has(node.id)),
-    edges,
-  };
-}
-
 function getZoomedViewBox(zoom: number, pan: PanState): string {
   const width = GRAPH_WORLD_WIDTH / zoom;
   const height = GRAPH_WORLD_HEIGHT / zoom;
@@ -891,10 +689,4 @@ function nodeRadius(node: DeckGraphNode): number {
 
 function trimLabel(label: string, max: number): string {
   return label.length > max ? `${label.slice(0, max - 1)}...` : label;
-}
-
-function edgeLabel(edge: DeckGraphEdge, selectedNodeId: string, otherNodeId: string): string {
-  const direction = edge.sourceId === selectedNodeId && edge.targetId === otherNodeId ? "out" : "in";
-  const kind = edge.kind.replace(/_/g, " ");
-  return direction === "out" ? `${kind} -> ${edge.evidence ?? ""}` : `<- ${kind} ${edge.evidence ?? ""}`;
 }

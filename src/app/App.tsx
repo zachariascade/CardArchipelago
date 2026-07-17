@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Brain, Copy, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
+import { Brain, MoreHorizontal, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
 import { AnalysisLayoutNode, AnalysisResult } from "../analysis/analysisSchema";
 import { LocalEndpointAnalysisProvider } from "../analysis/LocalEndpointAnalysisProvider";
 import { MockAnalysisProvider } from "../analysis/MockAnalysisProvider";
@@ -8,14 +8,15 @@ import { DeckGraphView } from "../components/deck-graph/DeckGraphView";
 import { DeckGrid, FilterMode, SortMode } from "../components/deck-grid/DeckGrid";
 import { DEFAULT_DECKLIST, ImportPanel } from "../components/import/ImportPanel";
 import { UnresolvedResolverPanel } from "../components/unresolved-resolver/UnresolvedResolverPanel";
-import { DeckEntry, DeckSnapshot, ScryfallCard, getImageUri, getPrimaryTypeLine } from "../deck/deckModel";
-import { DeckGraph, DeckGraphPatch, DeckGraphVariant, applyGraphPatches, buildDeckGraph, buildEnrichedDeckGraph } from "../deck/deckGraph";
+import { DeckBoard, DeckEntry, DeckSnapshot, ScryfallCard, getImageUri, getPrimaryTypeLine } from "../deck/deckModel";
+import { DeckGraph, DeckGraphPatch, applyGraphPatches, buildDeckGraph, normalizeDeckGraphEdgeId } from "../deck/deckGraph";
 import { availableQueries, getCardById, getCommander } from "../deck/deckQueries";
 import { parseDecklist } from "../deck/parseDecklist";
-import { hydrateDeckEntries, slugify } from "../deck/scryfall";
-import { ProviderConfig, StoredDeckGraphState, loadStoredState, saveStoredState } from "../storage/localDeckStorage";
+import { fetchCardAutocompleteNames, fetchFuzzyCardByName, hydrateDeckEntries, slugify } from "../deck/scryfall";
+import { ProviderConfig, QuestionThread, StoredDeckGraphState, loadStoredState, saveStoredState } from "../storage/localDeckStorage";
 
 const EDGE_DELETIONS_PATCH_KEY = "__edge_deletions__";
+const DECK_ANALYSIS_PATCH_KEY = "__deck_analysis__";
 
 export type HoverPreviewHandlers = {
   show: (cardId: string, anchor: HTMLElement) => void;
@@ -38,21 +39,37 @@ export function App() {
   const [graphStateByDeckId, setGraphStateByDeckId] = useState<Record<string, StoredDeckGraphState>>({});
   const [graphPatchesByDeckId, setGraphPatchesByDeckId] = useState<Record<string, Record<string, DeckGraphPatch>>>({});
   const [graphPatchErrorsByCardId, setGraphPatchErrorsByCardId] = useState<Record<string, string>>({});
-  const [providerConfig, setProviderConfig] = useState<ProviderConfig>({ mode: "mock", endpointUrl: "http://localhost:8787/analyze" });
+  const [providerConfig, setProviderConfig] = useState<ProviderConfig>({
+    mode: "mock",
+    endpointUrl: "http://localhost:8787/analyze",
+    codexModel: "gpt-5.4",
+    codexReasoningEffort: "low",
+  });
   const [warnings, setWarnings] = useState<string[]>([]);
   const [unresolvedNames, setUnresolvedNames] = useState<string[]>([]);
   const [importMessage, setImportMessage] = useState<string>();
   const [isImporting, setIsImporting] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isAnalyzingDeckGraph, setIsAnalyzingDeckGraph] = useState(false);
+  const [deckGraphPatchStatus, setDeckGraphPatchStatus] = useState<string>();
+  const [deckGraphPatchError, setDeckGraphPatchError] = useState<string>();
   const [graphAnalyzingCardId, setGraphAnalyzingCardId] = useState<string>();
+  const [questionText, setQuestionText] = useState("");
+  const [questionError, setQuestionError] = useState<string>();
+  const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
+  const [questionThreadsByDeckId, setQuestionThreadsByDeckId] = useState<Record<string, QuestionThread[]>>({});
+  const [activeQuestionThreadIdByDeckId, setActiveQuestionThreadIdByDeckId] = useState<Record<string, string | undefined>>({});
+  const [openQuestionThreadMenuId, setOpenQuestionThreadMenuId] = useState<string>();
   const [pendingImport, setPendingImport] = useState<{ deck: DeckSnapshot; candidates: DeckEntry[] }>();
   const [search, setSearch] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("category");
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [sortAscending, setSortAscending] = useState(true);
+  const [addCardStatus, setAddCardStatus] = useState<string>();
+  const [isAddingCard, setIsAddingCard] = useState(false);
   const [hasLoadedStorage, setHasLoadedStorage] = useState(false);
   const [cardPreview, setCardPreview] = useState<CardPreviewState>();
-  const [activeView, setActiveView] = useState<"import" | "deck" | "analysis" | "graph">("deck");
+  const [activeView, setActiveView] = useState<"import" | "deck" | "analysis" | "ask" | "graph">("deck");
 
   useEffect(() => {
     const stored = loadStoredState();
@@ -62,6 +79,8 @@ export function App() {
     setAnalysesByDeckId(stored.analysesByDeckId);
     setGraphStateByDeckId(stored.graphStateByDeckId);
     setGraphPatchesByDeckId(stored.graphPatchesByDeckId);
+    setQuestionThreadsByDeckId(stored.questionThreadsByDeckId);
+    setActiveQuestionThreadIdByDeckId(stored.activeQuestionThreadIdByDeckId);
     setProviderConfig(stored.providerConfig);
     setHasLoadedStorage(true);
   }, []);
@@ -74,29 +93,48 @@ export function App() {
       analysesByDeckId,
       graphStateByDeckId,
       graphPatchesByDeckId,
+      questionThreadsByDeckId,
+      activeQuestionThreadIdByDeckId,
       selectedCardId,
       selectedGraphNodeId: activeDeckId ? graphStateByDeckId[activeDeckId]?.selectedNodeId : undefined,
       analyses: [],
       providerConfig,
     });
-  }, [decks, activeDeckId, analysesByDeckId, graphStateByDeckId, graphPatchesByDeckId, selectedCardId, providerConfig, hasLoadedStorage]);
+  }, [
+    decks,
+    activeDeckId,
+    analysesByDeckId,
+    graphStateByDeckId,
+    graphPatchesByDeckId,
+    questionThreadsByDeckId,
+    activeQuestionThreadIdByDeckId,
+    selectedCardId,
+    providerConfig,
+    hasLoadedStorage,
+  ]);
 
   const provider = useMemo(() => {
-    if (providerConfig.mode === "local") return new LocalEndpointAnalysisProvider(providerConfig.endpointUrl);
+    if (providerConfig.mode === "local") {
+      return new LocalEndpointAnalysisProvider(providerConfig.endpointUrl, {
+        codexModel: providerConfig.codexModel,
+        codexReasoningEffort: providerConfig.codexReasoningEffort,
+      });
+    }
     return new MockAnalysisProvider();
   }, [providerConfig]);
 
   const deck = useMemo(() => decks.find((savedDeck) => savedDeck.id === activeDeckId), [decks, activeDeckId]);
   const analyses = deck ? analysesByDeckId[deck.id] ?? [] : [];
   const activeGraphState = deck ? graphStateByDeckId[deck.id] ?? {} : {};
-  const graphVariant = activeGraphState.variant ?? "base";
-  const baseDeckGraph = useMemo(() => (deck ? buildDeckGraph(deck) : undefined), [deck]);
   const deckGraphPatches = useMemo(() => (deck ? Object.values(graphPatchesByDeckId[deck.id] ?? {}) : []), [deck, graphPatchesByDeckId]);
   const deckGraphPatchCount = deck ? Object.keys(graphPatchesByDeckId[deck.id] ?? {}).filter((key) => key !== EDGE_DELETIONS_PATCH_KEY).length : 0;
-  const enrichedDeckGraph = useMemo(() => (deck ? applyGraphPatches(buildEnrichedDeckGraph(deck), deckGraphPatches, deck) : undefined), [deck, deckGraphPatches]);
-  const deckGraph = graphVariant === "ai-enriched" ? enrichedDeckGraph : baseDeckGraph;
+  const deckAnalysisGraphPatch = deck ? graphPatchesByDeckId[deck.id]?.[DECK_ANALYSIS_PATCH_KEY] : undefined;
+  const deckGraph = useMemo(() => (deck ? applyGraphPatches(buildDeckGraph(deck), deckGraphPatches, deck) : undefined), [deck, deckGraphPatches]);
   const modalCard = deck && modalCardId ? getCardById(deck, modalCardId) : undefined;
   const previewCard = deck && cardPreview ? getCardById(deck, cardPreview.cardId) : undefined;
+  const questionThreads = deck ? questionThreadsByDeckId[deck.id] ?? [] : [];
+  const activeQuestionThreadId = deck ? activeQuestionThreadIdByDeckId[deck.id] : undefined;
+  const activeQuestionThread = activeQuestionThreadId ? questionThreads.find((thread) => thread.id === activeQuestionThreadId) : undefined;
   const commander = deck ? getCommander(deck) : undefined;
   const latestDeckAnalysis = analyses.find((analysis) => analysis.kind === "deck-overview");
   const modalCardAnalysis = modalCard ? findLatestCardAnalysis(analyses, modalCard.id) : undefined;
@@ -116,6 +154,28 @@ export function App() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [modalCardId]);
+
+  useEffect(() => {
+    setQuestionError(undefined);
+    setOpenQuestionThreadMenuId(undefined);
+  }, [activeDeckId]);
+
+  useEffect(() => {
+    if (!openQuestionThreadMenuId) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest(".question-thread-menu")) return;
+      setOpenQuestionThreadMenuId(undefined);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenQuestionThreadMenuId(undefined);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openQuestionThreadMenuId]);
 
   async function importDeck() {
     setIsImporting(true);
@@ -183,7 +243,6 @@ export function App() {
       [nextDeck.id]: {
         selectedNodeId: nextSelectedCardId ? `card:${nextSelectedCardId}` : undefined,
         hiddenNodeIds: [],
-        variant: "base",
       },
     }));
     setActiveView("deck");
@@ -198,7 +257,6 @@ export function App() {
       ...current,
       [deckId]: {
         hiddenNodeIds: current[deckId]?.hiddenNodeIds ?? [],
-        variant: current[deckId]?.variant ?? "base",
         selectedNodeId:
           current[deckId]?.selectedNodeId ??
           (nextDeck?.commanderId ? `card:${nextDeck.commanderId}` : nextDeck?.entries[0] ? `card:${nextDeck.entries[0].id}` : undefined),
@@ -212,6 +270,89 @@ export function App() {
     if (!deck) return;
     await runAnalysis(() => provider.analyzeDeck({ deck, availableQueries }));
     setActiveView("analysis");
+  }
+
+  async function answerDeckQuestion() {
+    if (!deck) return;
+    const question = questionText.trim();
+    if (!question) {
+      setQuestionError("Ask a question first.");
+      return;
+    }
+    setIsAnsweringQuestion(true);
+    setQuestionError(undefined);
+    try {
+      const result = await provider.answerQuestion({ deck, availableQueries, question });
+      saveQuestionThreadMessage(deck.id, question, result);
+      setQuestionText("");
+    } catch (error) {
+      setQuestionError(error instanceof Error ? error.message : "Question failed.");
+    } finally {
+      setIsAnsweringQuestion(false);
+    }
+  }
+
+  function startNewQuestionThread() {
+    if (!deck) return;
+    setActiveQuestionThreadIdByDeckId((current) => ({ ...current, [deck.id]: undefined }));
+    setQuestionText("");
+    setQuestionError(undefined);
+    setOpenQuestionThreadMenuId(undefined);
+  }
+
+  function selectQuestionThread(threadId: string) {
+    if (!deck) return;
+    setActiveQuestionThreadIdByDeckId((current) => ({ ...current, [deck.id]: threadId }));
+    setQuestionError(undefined);
+    setOpenQuestionThreadMenuId(undefined);
+  }
+
+  function deleteQuestionThread(threadId: string) {
+    if (!deck) return;
+    const thread = questionThreads.find((item) => item.id === threadId);
+    const confirmed = window.confirm(`Delete "${thread?.title ?? "this thread"}"?`);
+    if (!confirmed) return;
+    const remainingThreads = questionThreads.filter((item) => item.id !== threadId);
+    setQuestionThreadsByDeckId((current) => ({ ...current, [deck.id]: remainingThreads }));
+    setActiveQuestionThreadIdByDeckId((current) => ({
+      ...current,
+      [deck.id]: current[deck.id] === threadId ? remainingThreads[0]?.id : current[deck.id],
+    }));
+    setOpenQuestionThreadMenuId(undefined);
+  }
+
+  function saveQuestionThreadMessage(deckId: string, question: string, response: AnalysisResult) {
+    const now = new Date().toISOString();
+    const threadId = activeQuestionThread?.id ?? `question_thread_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const message = {
+      id: `question_message_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      question,
+      response,
+      createdAt: now,
+    };
+    setQuestionThreadsByDeckId((current) => {
+      const threads = current[deckId] ?? [];
+      const existingThread = threads.find((thread) => thread.id === threadId);
+      const nextThread: QuestionThread = existingThread
+        ? {
+            ...existingThread,
+            messages: [...existingThread.messages, message],
+            updatedAt: now,
+          }
+        : {
+            id: threadId,
+            deckId,
+            title: makeQuestionThreadTitle(question),
+            messages: [message],
+            createdAt: now,
+            updatedAt: now,
+          };
+      return {
+        ...current,
+        [deckId]: [nextThread, ...threads.filter((thread) => thread.id !== threadId)],
+      };
+    });
+    setActiveQuestionThreadIdByDeckId((current) => ({ ...current, [deckId]: threadId }));
   }
 
   async function analyzeCard(cardId = selectedCardId) {
@@ -247,11 +388,11 @@ export function App() {
   }
 
   async function analyzeCardGraph(cardId: string, prompt?: string) {
-    if (!deck || !enrichedDeckGraph) return;
+    if (!deck || !deckGraph) return;
     const trimmedPrompt = prompt?.trim();
     setGraphAnalyzingCardId(cardId);
     try {
-      const patch = await provider.analyzeCardGraph({ deck, graph: enrichedDeckGraph, cardId, availableQueries, prompt: trimmedPrompt });
+      const patch = await provider.analyzeCardGraph({ deck, graph: deckGraph, cardId, availableQueries, prompt: trimmedPrompt });
       setGraphPatchesByDeckId((current) => ({
         ...current,
         [deck.id]: {
@@ -268,7 +409,6 @@ export function App() {
         ...current,
         [deck.id]: {
           ...current[deck.id],
-          variant: "ai-enriched",
           selectedNodeId: `card:${cardId}`,
         },
       }));
@@ -292,6 +432,58 @@ export function App() {
       }));
     } finally {
       setGraphAnalyzingCardId(undefined);
+    }
+  }
+
+  async function analyzeDeckGraph() {
+    if (!deck || !deckGraph) return;
+    setIsAnalyzingDeckGraph(true);
+    setDeckGraphPatchError(undefined);
+    setDeckGraphPatchStatus("Generating deck patch...");
+    try {
+      const patch = await provider.analyzeDeckGraph({ deck, graph: deckGraph, availableQueries });
+      setGraphPatchesByDeckId((current) => ({
+        ...current,
+        [deck.id]: {
+          ...(current[deck.id] ?? {}),
+          [DECK_ANALYSIS_PATCH_KEY]: patch,
+        },
+      }));
+      setDeckGraphPatchStatus(
+        `Deck patch saved ${patch.nodesToUpsert.length} group${patch.nodesToUpsert.length === 1 ? "" : "s"}, ${patch.edgeFunctions?.length ?? 0} function${(patch.edgeFunctions?.length ?? 0) === 1 ? "" : "s"}, and ${patch.edgesToUpsert.length} direct connection${patch.edgesToUpsert.length === 1 ? "" : "s"}.${formatGraphPatchUsage(patch)}`,
+      );
+      const firstGeneratedNodeId = patch.nodesToUpsert[0]?.id;
+      if (firstGeneratedNodeId) {
+        setGraphStateByDeckId((current) => ({
+          ...current,
+          [deck.id]: {
+            ...current[deck.id],
+            selectedNodeId: firstGeneratedNodeId,
+          },
+        }));
+      }
+      setActiveView("graph");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Deck graph analysis failed.";
+      setDeckGraphPatchError(message);
+      setDeckGraphPatchStatus(undefined);
+      setAnalysesByDeckId((current) => ({
+        ...current,
+        [deck.id]: [
+          {
+            id: `deck_graph_patch_error_${Date.now()}`,
+            kind: "freeform",
+            title: "Deck Graph Analysis Failed",
+            summary: message,
+            layout: { type: "NarrativePanel", title: "Deck Graph Patch Error", body: message },
+            createdAt: new Date().toISOString(),
+            source: providerConfig.mode === "local" ? "custom" : "mock",
+          },
+          ...(current[deck.id] ?? []),
+        ],
+      }));
+    } finally {
+      setIsAnalyzingDeckGraph(false);
     }
   }
 
@@ -320,6 +512,20 @@ export function App() {
     });
   }
 
+  function clearDeckGraphPatch() {
+    if (!deck || !deckAnalysisGraphPatch) return;
+    setDeckGraphPatchStatus("Deck patch deleted.");
+    setDeckGraphPatchError(undefined);
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = { ...(current[deck.id] ?? {}) };
+      delete deckPatches[DECK_ANALYSIS_PATCH_KEY];
+      return {
+        ...current,
+        [deck.id]: deckPatches,
+      };
+    });
+  }
+
   function clearAllDeckGraphPatches() {
     if (!deck || deckGraphPatchCount === 0) return;
     const confirmed = window.confirm(`Delete all ${deckGraphPatchCount} saved AI graph patch${deckGraphPatchCount === 1 ? "" : "es"} for ${deck.name}?`);
@@ -336,17 +542,23 @@ export function App() {
   }
 
   function deleteGraphEdge(edgeId: string) {
+    deleteGraphEdges([edgeId]);
+  }
+
+  function deleteGraphEdges(edgeIds: string[], label?: string) {
     if (!deck || !deckGraph) return;
-    const edge = deckGraph.edges.find((item) => item.id === edgeId);
-    if (!edge) return;
-    const sourceLabel = deckGraph.nodes.find((node) => node.id === edge.sourceId)?.label ?? edge.sourceId;
-    const targetLabel = deckGraph.nodes.find((node) => node.id === edge.targetId)?.label ?? edge.targetId;
-    const confirmed = window.confirm(`Delete this ${edge.kind.replace("_", " ")} edge?\n\n${sourceLabel} -> ${targetLabel}`);
+    const uniqueEdgeIds = Array.from(new Set(edgeIds));
+    const edges = uniqueEdgeIds.map((edgeId) => deckGraph.edges.find((item) => item.id === edgeId)).filter((edge): edge is NonNullable<typeof edge> => Boolean(edge));
+    if (!edges.length) return;
+    const confirmed =
+      edges.length === 1
+        ? window.confirm(formatDeleteEdgeConfirmation(deckGraph, edges[0]))
+        : window.confirm(`Delete ${edges.length} generated connection${edges.length === 1 ? "" : "s"}${label ? ` from ${label}` : ""}?`);
     if (!confirmed) return;
     setGraphPatchesByDeckId((current) => {
       const deckPatches = current[deck.id] ?? {};
       const currentPatch = deckPatches[EDGE_DELETIONS_PATCH_KEY];
-      const removedIds = Array.from(new Set([...(currentPatch?.edgeIdsToRemove ?? []), edgeId]));
+      const removedIds = Array.from(new Set([...(currentPatch?.edgeIdsToRemove ?? []), ...edges.map((edge) => edge.id)]));
       const deletionPatch: DeckGraphPatch = {
         id: currentPatch?.id ?? `patch_${deck.id}_edge_deletions`,
         deckId: deck.id,
@@ -378,24 +590,6 @@ export function App() {
         selectedNodeId: nodeId,
       },
     }));
-  }
-
-  function setGraphVariant(variant: DeckGraphVariant) {
-    if (!deck) return;
-    const nextGraph = variant === "ai-enriched" ? enrichedDeckGraph : baseDeckGraph;
-    setGraphStateByDeckId((current) => {
-      const currentState = current[deck.id] ?? {};
-      const currentSelection = currentState.selectedNodeId;
-      const selectionExists = currentSelection ? nextGraph?.nodes.some((node) => node.id === currentSelection) : false;
-      return {
-        ...current,
-        [deck.id]: {
-          ...currentState,
-          variant,
-          selectedNodeId: selectionExists ? currentSelection : nextGraph?.nodes[0]?.id,
-        },
-      };
-    });
   }
 
   function hideGraphNode(nodeId: string) {
@@ -479,6 +673,126 @@ export function App() {
     setUnresolvedNames((current) => current.filter((name) => name !== unresolvedEntry.name));
   }
 
+  function moveCardToBoard(cardId: string, board: DeckBoard) {
+    if (!deck) return;
+    const now = new Date().toISOString();
+    setDecks((current) =>
+      current.map((savedDeck) =>
+        savedDeck.id === deck.id
+          ? {
+              ...savedDeck,
+              entries: savedDeck.entries.map((entry) => (entry.id === cardId ? { ...entry, board } : entry)),
+              updatedAt: now,
+            }
+          : savedDeck,
+      ),
+    );
+  }
+
+  async function addCardToDeck(name: string, quantity: number, board: DeckBoard) {
+    if (!deck) return;
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    const safeQuantity = Math.max(1, Math.floor(quantity));
+    setIsAddingCard(true);
+    setAddCardStatus(`Importing ${trimmedName} from Scryfall...`);
+    try {
+      const card = await fetchFuzzyCardByName(trimmedName);
+      const now = new Date().toISOString();
+      let nextSelectedCardId = card.id;
+      setDecks((current) =>
+        current.map((savedDeck) => {
+          if (savedDeck.id !== deck.id) return savedDeck;
+          const existingEntry = savedDeck.entries.find((entry) => entry.id === card.id);
+          const entries = existingEntry
+            ? savedDeck.entries.map((entry) =>
+                entry.id === card.id
+                  ? {
+                      ...entry,
+                      quantity: entry.quantity + safeQuantity,
+                      board,
+                      unresolved: false,
+                      scryfall: card,
+                    }
+                  : entry,
+              )
+            : [
+                ...savedDeck.entries,
+                {
+                  id: card.id,
+                  name: card.name,
+                  quantity: safeQuantity,
+                  board,
+                  scryfall: card,
+                },
+              ];
+          return {
+            ...savedDeck,
+            entries,
+            updatedAt: now,
+          };
+        }),
+      );
+      setSelectedCardId(nextSelectedCardId);
+      setAddCardStatus(`Added ${safeQuantity} ${card.name}${safeQuantity === 1 ? "" : "s"} to ${board === "mainboard" ? "Mainboard" : "Sideboard"}.`);
+    } catch (error) {
+      setAddCardStatus(error instanceof Error ? error.message : "Could not add that card.");
+    } finally {
+      setIsAddingCard(false);
+    }
+  }
+
+  function deleteCardFromDeck(cardId: string) {
+    if (!deck) return;
+    const card = deck.entries.find((entry) => entry.id === cardId);
+    if (!card) return;
+    const confirmed = window.confirm(`Delete ${card.name} from ${deck.name}?`);
+    if (!confirmed) return;
+    const nextEntries = deck.entries.filter((entry) => entry.id !== cardId);
+    const nextSelectedCardId =
+      selectedCardId === cardId ? deck.commanderId && deck.commanderId !== cardId ? deck.commanderId : nextEntries[0]?.id : selectedCardId;
+    setDecks((current) =>
+      current.map((savedDeck) =>
+        savedDeck.id === deck.id
+          ? {
+              ...savedDeck,
+              commanderId: savedDeck.commanderId === cardId ? undefined : savedDeck.commanderId,
+              entries: savedDeck.entries.filter((entry) => entry.id !== cardId),
+              updatedAt: new Date().toISOString(),
+            }
+          : savedDeck,
+      ),
+    );
+    setGraphPatchErrorsByCardId((current) => {
+      const next = { ...current };
+      delete next[cardId];
+      return next;
+    });
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = { ...(current[deck.id] ?? {}) };
+      delete deckPatches[cardId];
+      return {
+        ...current,
+        [deck.id]: deckPatches,
+      };
+    });
+    setGraphStateByDeckId((current) => {
+      const state = current[deck.id] ?? {};
+      return {
+        ...current,
+        [deck.id]: {
+          ...state,
+          selectedNodeId: state.selectedNodeId === `card:${cardId}` ? (nextSelectedCardId ? `card:${nextSelectedCardId}` : undefined) : state.selectedNodeId,
+          hiddenNodeIds: state.hiddenNodeIds?.filter((nodeId) => nodeId !== `card:${cardId}`),
+        },
+      };
+    });
+    if (modalCardId === cardId) setModalCardId(undefined);
+    setCardPreview(undefined);
+    setSelectedCardId(nextSelectedCardId);
+    setAddCardStatus(`Deleted ${card.name}.`);
+  }
+
   function deleteAnalysisNode(analysisId: string, path: AnalysisNodePath) {
     if (!deck) return;
     setAnalysesByDeckId((current) => ({
@@ -560,6 +874,25 @@ export function App() {
             disabled={providerConfig.mode !== "local"}
             aria-label="Local endpoint URL"
           />
+          <select
+            value={providerConfig.codexModel}
+            onChange={(event) => setProviderConfig((current) => ({ ...current, codexModel: event.target.value }))}
+            disabled={providerConfig.mode !== "local"}
+            aria-label="Codex model"
+          >
+            <option value="gpt-5.4">GPT-5.4</option>
+            <option value="gpt-5.5">GPT-5.5</option>
+          </select>
+          <select
+            value={providerConfig.codexReasoningEffort}
+            onChange={(event) => setProviderConfig((current) => ({ ...current, codexReasoningEffort: event.target.value as ProviderConfig["codexReasoningEffort"] }))}
+            disabled={providerConfig.mode !== "local"}
+            aria-label="Codex reasoning effort"
+          >
+            <option value="low">Low effort</option>
+            <option value="medium">Medium effort</option>
+            <option value="high">High effort</option>
+          </select>
         </div>
       </header>
 
@@ -572,6 +905,9 @@ export function App() {
         </button>
         <button type="button" className={activeView === "analysis" ? "active" : ""} onClick={() => setActiveView("analysis")}>
           Analysis
+        </button>
+        <button type="button" className={activeView === "ask" ? "active" : ""} onClick={() => setActiveView("ask")}>
+          Ask AI
         </button>
         <button type="button" className={activeView === "graph" ? "active" : ""} onClick={() => setActiveView("graph")}>
           Graph
@@ -618,27 +954,6 @@ export function App() {
             </section>
           )}
 
-          {deck && (
-            <section className="deck-summary-band">
-              <div>
-                <span>Commander</span>
-                <strong>{commander?.name ?? "Choose one"}</strong>
-              </div>
-              <div>
-                <span>Unique Cards</span>
-                <strong>{deck.entries.length}</strong>
-              </div>
-              <div>
-                <span>Total Cards</span>
-                <strong>{deck.entries.reduce((sum, entry) => sum + entry.quantity, 0)}</strong>
-              </div>
-              <button type="button" className="primary-button" onClick={analyzeDeck} disabled={isAnalyzing}>
-                <Brain size={17} />
-                Analyze Deck
-              </button>
-            </section>
-          )}
-
           {deck && <UnresolvedResolverPanel entries={deck.entries} onResolve={resolveDeckEntry} />}
 
           {deck && (
@@ -655,6 +970,12 @@ export function App() {
                 onFilterModeChange={setFilterMode}
                 onSortAscendingChange={setSortAscending}
                 onSelectCard={openCardModal}
+                onMoveCardToBoard={moveCardToBoard}
+                onDeleteCard={deleteCardFromDeck}
+                onAddCard={addCardToDeck}
+                onSearchCardNames={fetchCardAutocompleteNames}
+                addCardStatus={addCardStatus}
+                isAddingCard={isAddingCard}
               />
             </section>
           )}
@@ -725,6 +1046,103 @@ export function App() {
         </section>
       )}
 
+      {activeView === "ask" && (
+        <section className="analysis-view">
+          <div className="analysis-view-header">
+            <div>
+              <h2>Ask AI</h2>
+              <p>{deck ? `Ask a one-off question about ${deck.name}.` : "Import a deck to ask questions."}</p>
+            </div>
+          </div>
+
+          {deck ? (
+            <section className="question-workspace">
+              <aside className="question-sidebar" aria-label="Ask AI threads">
+                <button type="button" className="primary-button question-new-thread-button" onClick={startNewQuestionThread}>
+                  <Plus size={16} />
+                  New Chat
+                </button>
+                <div className="question-thread-list">
+                  {questionThreads.length ? (
+                    questionThreads.map((thread) => (
+                      <div key={thread.id} className={`question-thread-row ${thread.id === activeQuestionThreadId ? "active" : ""}`}>
+                        <button type="button" className="question-thread-main" onClick={() => selectQuestionThread(thread.id)}>
+                          <strong>{thread.title}</strong>
+                          <span>{formatQuestionThreadDate(thread.updatedAt)}</span>
+                        </button>
+                        <div className={`question-thread-menu ${openQuestionThreadMenuId === thread.id ? "open" : ""}`}>
+                          <button
+                            type="button"
+                            className="icon-button question-thread-menu-trigger"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setOpenQuestionThreadMenuId((current) => (current === thread.id ? undefined : thread.id));
+                            }}
+                            aria-label={`Open actions for ${thread.title}`}
+                          >
+                            <MoreHorizontal size={17} />
+                          </button>
+                          <div className="question-thread-menu-popover">
+                            <button type="button" className="question-thread-delete" onClick={() => deleteQuestionThread(thread.id)}>
+                              <Trash2 size={15} />
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="question-sidebar-empty">No saved chats yet.</p>
+                  )}
+                </div>
+              </aside>
+
+              <div className="question-main">
+                <section className="question-panel" aria-label="Ask a question">
+                  <label htmlFor="deck-question">
+                    <span>{activeQuestionThread ? "Follow-up" : "Question"}</span>
+                    <textarea
+                      id="deck-question"
+                      value={questionText}
+                      onChange={(event) => setQuestionText(event.target.value)}
+                      placeholder="Example: Which cards best support my commander, and why?"
+                      rows={5}
+                    />
+                  </label>
+                  <div className="question-panel-actions">
+                    <button type="button" className="primary-button" onClick={() => void answerDeckQuestion()} disabled={isAnsweringQuestion}>
+                      <Brain size={17} />
+                      {isAnsweringQuestion ? "Answering..." : activeQuestionThread ? "Ask Follow-up" : "Ask Question"}
+                    </button>
+                  </div>
+                  {questionError && <p className="question-error">{questionError}</p>}
+                </section>
+
+                {activeQuestionThread?.messages.length ? (
+                  <div className="question-message-stack">
+                    {activeQuestionThread.messages.map((message) => (
+                      <section className="question-message" key={message.id}>
+                        <div className="question-bubble">
+                          <span>{formatQuestionThreadDate(message.createdAt)}</span>
+                          <p>{message.question}</p>
+                        </div>
+                        <AnalysisRenderer deck={deck} analysis={message.response} onSelectCard={openCardModal} hoverPreview={hoverPreview} />
+                      </section>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="analysis-empty-state">
+                    Ask a question to start a saved chat for this deck.
+                  </div>
+                )}
+              </div>
+            </section>
+          ) : (
+            <div className="analysis-empty-state">No deck selected.</div>
+          )}
+        </section>
+      )}
+
       {activeView === "graph" && (
         deck && deckGraph ? (
           <DeckGraphView
@@ -734,20 +1152,37 @@ export function App() {
             hiddenNodeIds={activeGraphState.hiddenNodeIds ?? []}
             isAnalyzing={isAnalyzing || graphAnalyzingCardId === selectedGraphNode?.cardId}
             latestAnalysis={latestGraphNodeAnalysis}
-            graphVariant={graphVariant}
+            connectionsPlacement="below-graph"
             onSelectNode={selectGraphNode}
-            onGraphVariantChange={setGraphVariant}
             onOpenCard={openCardModal}
             onAnalyzeNode={(nodeId) => void analyzeGraphNode(nodeId)}
             onPromptAnalyzeNode={(nodeId, prompt) => void analyzeGraphNodePrompt(nodeId, prompt)}
             onHideNode={hideGraphNode}
             onDeleteEdge={deleteGraphEdge}
+            onDeleteEdges={deleteGraphEdges}
             onResetHiddenNodes={resetHiddenGraphNodes}
-            toolbarActions={
-              <button type="button" className="secondary-button" onClick={clearAllDeckGraphPatches} disabled={deckGraphPatchCount === 0}>
-                <Trash2 size={16} />
-                Clear AI Patches
-              </button>
+          toolbarActions={
+              <>
+                <button type="button" className="primary-button" onClick={() => void analyzeDeckGraph()} disabled={isAnalyzingDeckGraph}>
+                  <Sparkles size={16} />
+                  {isAnalyzingDeckGraph ? "Generating..." : deckAnalysisGraphPatch ? "Refresh Deck Patch" : "Generate Deck Patch"}
+                </button>
+                {deckAnalysisGraphPatch && (
+                  <button type="button" className="secondary-button" onClick={clearDeckGraphPatch}>
+                    <Trash2 size={16} />
+                    Delete Deck Patch
+                  </button>
+                )}
+                <button type="button" className="secondary-button" onClick={clearAllDeckGraphPatches} disabled={deckGraphPatchCount === 0}>
+                  <Trash2 size={16} />
+                  Clear AI Patches
+                </button>
+                {(deckGraphPatchError || deckGraphPatchStatus) && (
+                  <span className={deckGraphPatchError ? "graph-patch-status error" : "graph-patch-status"}>
+                    {deckGraphPatchError ?? deckGraphPatchStatus}
+                  </span>
+                )}
+              </>
             }
             hoverPreview={hoverPreview}
           />
@@ -770,6 +1205,7 @@ export function App() {
           onAnalyzeCardGraph={(prompt) => void analyzeCardGraph(modalCard.id, prompt)}
           onClearCardGraphPatch={() => clearCardGraphPatch(modalCard.id)}
           onDeleteGraphEdge={deleteGraphEdge}
+          onDeleteGraphEdges={deleteGraphEdges}
           onSelectCard={openCardModal}
           hoverPreview={hoverPreview}
           onDeleteAnalysisNode={modalCardAnalysis ? (path) => deleteAnalysisNode(modalCardAnalysis.id, path) : undefined}
@@ -795,6 +1231,7 @@ function CardDetailModal({
   onAnalyzeCardGraph,
   onClearCardGraphPatch,
   onDeleteGraphEdge,
+  onDeleteGraphEdges,
   onSelectCard,
   hoverPreview,
   onDeleteAnalysisNode,
@@ -812,6 +1249,7 @@ function CardDetailModal({
   onAnalyzeCardGraph: (prompt?: string) => void;
   onClearCardGraphPatch: () => void;
   onDeleteGraphEdge: (edgeId: string) => void;
+  onDeleteGraphEdges: (edgeIds: string[], label?: string) => void;
   onSelectCard: (cardId: string) => void;
   hoverPreview: HoverPreviewHandlers;
   onDeleteAnalysisNode?: (path: AnalysisNodePath) => void;
@@ -826,7 +1264,7 @@ function CardDetailModal({
     setSelectedModalGraphNodeId(`card:${card.id}`);
     setPatchCopyStatus(undefined);
     setGraphPrompt("");
-  }, [card.id, graph?.variant]);
+  }, [card.id]);
 
   useEffect(() => {
     setActiveModalTab("graph");
@@ -836,9 +1274,9 @@ function CardDetailModal({
     if (!graphPatch) return;
     try {
       await navigator.clipboard.writeText(JSON.stringify(graphPatch, null, 2));
-      setPatchCopyStatus("Patch JSON copied.");
+      setPatchCopyStatus("Connections JSON copied.");
     } catch {
-      setPatchCopyStatus("Could not copy patch JSON.");
+      setPatchCopyStatus("Could not copy connections JSON.");
     }
   }
 
@@ -870,54 +1308,36 @@ function CardDetailModal({
             )}
 
             {activeModalTab === "graph" && graph && (
-              <>
-                <div className="modal-graph-actions">
-                  <button type="button" className="primary-button" onClick={() => onAnalyzeCardGraph()} disabled={isAnalyzingGraph}>
-                    <Brain size={16} />
-                    {isAnalyzingGraph ? "Analyzing Graph..." : "Analyze Card Graph"}
-                  </button>
-                  {graphPatch && (
-                    <>
-                      <button type="button" className="secondary-button" onClick={() => void copyGraphPatchJson()} disabled={isAnalyzingGraph}>
-                        <Copy size={16} />
-                        Copy Patch JSON
-                      </button>
-                      <button type="button" className="secondary-button" onClick={onClearCardGraphPatch} disabled={isAnalyzingGraph}>
-                        <X size={16} />
-                        Clear Patch
-                      </button>
-                    </>
-                  )}
-                  <span>
-                    {graphError ??
-                      patchCopyStatus ??
-                      (graphPatch
-                        ? `Last graph analysis saved ${graphPatch.edgesToUpsert.length} direct edge${graphPatch.edgesToUpsert.length === 1 ? "" : "s"} and ${graphPatch.edgeFunctions?.length ?? 0} edge function${(graphPatch.edgeFunctions?.length ?? 0) === 1 ? "" : "s"}.`
-                        : "Generate AI graph edges, then build up the deck graph card by card.")}
-                  </span>
-                </div>
-                <div className="graph-prompt-panel modal-graph-prompt">
-                  <label htmlFor={`modal-graph-prompt-${card.id}`}>
-                    <span>Prompt</span>
-                    <textarea
-                      id={`modal-graph-prompt-${card.id}`}
-                      value={graphPrompt}
-                      onChange={(event) => setGraphPrompt(event.target.value)}
-                      placeholder="Example: create a custom group for every card that can feed this payoff."
-                      rows={3}
-                    />
-                  </label>
+              <div className="graph-prompt-panel modal-graph-prompt">
+                <label htmlFor={`modal-graph-prompt-${card.id}`}>
+                  <span>Prompt Optional</span>
+                  <textarea
+                    id={`modal-graph-prompt-${card.id}`}
+                    value={graphPrompt}
+                    onChange={(event) => setGraphPrompt(event.target.value)}
+                    placeholder="Example: create a custom group for every card that can feed this payoff."
+                    rows={3}
+                  />
+                </label>
+                <div className="modal-graph-prompt-actions">
                   <button
                     type="button"
                     className="primary-button"
                     onClick={() => onAnalyzeCardGraph(graphPrompt)}
-                    disabled={isAnalyzingGraph || !graphPrompt.trim()}
+                    disabled={isAnalyzingGraph}
                   >
                     <Brain size={16} />
-                    {isAnalyzingGraph ? "Analyzing..." : "Analyze Prompt"}
+                    {isAnalyzingGraph ? "Analyzing..." : "Analyze Card Graph"}
                   </button>
                 </div>
-              </>
+                <p className="modal-graph-prompt-status">
+                  {graphError ??
+                    patchCopyStatus ??
+                    (graphPatch
+                      ? `Last graph analysis saved ${graphPatch.edgesToUpsert.length} direct edge${graphPatch.edgesToUpsert.length === 1 ? "" : "s"} and ${graphPatch.edgeFunctions?.length ?? 0} edge function${(graphPatch.edgeFunctions?.length ?? 0) === 1 ? "" : "s"}.${formatGraphPatchUsage(graphPatch)}`
+                      : "Generate AI graph edges with an optional prompt, then build up the deck graph card by card.")}
+                </p>
+              </div>
             )}
           </div>
           <div className="modal-card-image">
@@ -947,11 +1367,13 @@ function CardDetailModal({
                 isAnalyzing={false}
                 title="Graph"
                 className="modal-graph-workspace"
-                showVariantControls={false}
                 showFocusToggle
                 onSelectNode={setSelectedModalGraphNodeId}
                 onOpenCard={onSelectCard}
                 onDeleteEdge={onDeleteGraphEdge}
+                onDeleteEdges={onDeleteGraphEdges}
+                onCopyConnectionsJson={graphPatch ? () => void copyGraphPatchJson() : undefined}
+                onDeleteConnectionsPatch={graphPatch ? onClearCardGraphPatch : undefined}
                 hoverPreview={hoverPreview}
               />
             ) : (
@@ -1057,12 +1479,41 @@ function mergeDeckGraphPatches(existing: DeckGraphPatch | undefined, incoming: D
     ...incoming,
     id: existing.id,
     nodesToUpsert: mergeById(existing.nodesToUpsert, incoming.nodesToUpsert),
-    edgesToUpsert: mergeById(existing.edgesToUpsert, incoming.edgesToUpsert),
+    edgesToUpsert: mergeById(existing.edgesToUpsert.map(normalizeDeckGraphEdgeId), incoming.edgesToUpsert.map(normalizeDeckGraphEdgeId)),
     edgeFunctions: mergeById(existing.edgeFunctions ?? [], incoming.edgeFunctions ?? []),
     edgeIdsToRemove: Array.from(new Set([...(existing.edgeIdsToRemove ?? []), ...(incoming.edgeIdsToRemove ?? [])])),
     notes: [...existing.notes, ...incoming.notes],
     generatedAt: new Date().toISOString(),
   };
+}
+
+function formatGraphPatchUsage(graphPatch: DeckGraphPatch): string {
+  const usage = graphPatch.usage;
+  if (!usage) return "";
+  if (usage.reportedTotalTokens) return ` Tokens used: ${formatCount(usage.reportedTotalTokens)}.`;
+  return ` Estimated tokens used: ${formatCount(usage.totalTokensEstimate)} (${formatCount(usage.promptTokensEstimate + usage.contextFileTokensEstimate)} in, ${formatCount(usage.outputTokensEstimate)} out).`;
+}
+
+function formatDeleteEdgeConfirmation(graph: DeckGraph, edge: DeckGraph["edges"][number]): string {
+  const sourceLabel = graph.nodes.find((node) => node.id === edge.sourceId)?.label ?? edge.sourceId;
+  const targetLabel = graph.nodes.find((node) => node.id === edge.targetId)?.label ?? edge.targetId;
+  return `Delete this ${edge.kind.replace("_", " ")} edge?\n\n${sourceLabel} -> ${targetLabel}`;
+}
+
+function formatCount(value: number): string {
+  return Math.round(value).toLocaleString();
+}
+
+function makeQuestionThreadTitle(question: string): string {
+  const title = question.replace(/\s+/g, " ").trim();
+  if (!title) return "Untitled chat";
+  return title.length > 48 ? `${title.slice(0, 45)}...` : title;
+}
+
+function formatQuestionThreadDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
 function mergeById<T extends { id: string }>(existing: T[], incoming: T[]): T[] {
