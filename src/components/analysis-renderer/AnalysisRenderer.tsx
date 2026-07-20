@@ -29,8 +29,44 @@ export function AnalysisRenderer({
         <h2>{analysis.title}</h2>
         {analysis.summary && <p>{analysis.summary}</p>}
       </div>
+      <AnalysisRunDetails analysis={analysis} />
       <RenderNode deck={deck} analysis={analysis} node={analysis.layout} path={[]} onSelectCard={onSelectCard} hoverPreview={hoverPreview} onDeleteNode={onDeleteNode} />
     </section>
+  );
+}
+
+function AnalysisRunDetails({ analysis }: { analysis: AnalysisResult }) {
+  const [activeTab, setActiveTab] = useState<"prompt" | "reasoning">("reasoning");
+  const hasPrompt = Boolean(analysis.promptText?.trim());
+  const hasReasoning = Boolean(analysis.reasoningSummary?.trim());
+  if (!hasPrompt && !hasReasoning && analysis.generationTimeMs === undefined) return null;
+
+  const activeContent =
+    activeTab === "prompt"
+      ? analysis.promptText?.trim() || "No prompt text was captured for this analysis."
+      : analysis.reasoningSummary?.trim() || "No reasoning summary was captured for this analysis.";
+
+  return (
+    <div className="analysis-run-details">
+      {analysis.generationTimeMs !== undefined && (
+        <div className="analysis-run-meta">
+          Generated in <strong>{formatDuration(analysis.generationTimeMs)}</strong>
+        </div>
+      )}
+      {(hasPrompt || hasReasoning) && (
+        <>
+          <div className="tab-row analysis-run-tabs" role="tablist" aria-label="Analysis run details">
+            <button type="button" className={activeTab === "prompt" ? "active" : ""} onClick={() => setActiveTab("prompt")}>
+              Prompt
+            </button>
+            <button type="button" className={activeTab === "reasoning" ? "active" : ""} onClick={() => setActiveTab("reasoning")}>
+              Reasoning
+            </button>
+          </div>
+          <pre className="analysis-run-text">{activeContent}</pre>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -354,4 +390,13 @@ function DeleteAnalysisButton({ onDelete }: { onDelete?: () => void }) {
       <Trash2 size={15} />
     </button>
   );
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  const seconds = milliseconds / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }

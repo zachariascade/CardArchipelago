@@ -27,7 +27,10 @@ export function DeckStackCard({
 }) {
   const imageUri = getImageUri(entry);
   const board = getEntryBoard(entry);
-  const classes = ["deck-card", className, isSelected ? "selected" : undefined, isMenuOpen ? "menu-open" : undefined].filter(Boolean).join(" ");
+  const hasMenu = Boolean(onToggleMenu && (onMoveToBoard || onDelete));
+  const classes = ["deck-card", className, hasMenu ? "has-menu" : undefined, isSelected ? "selected" : undefined, isMenuOpen ? "menu-open" : undefined]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className={classes}>
@@ -48,7 +51,7 @@ export function DeckStackCard({
         )}
         {entry.quantity > 1 && <span className="card-qty" aria-label={`Quantity ${entry.quantity}`}>{entry.quantity}</span>}
       </button>
-      {onToggleMenu && (onMoveToBoard || onDelete) && (
+      {hasMenu && (
         <div className="deck-card-menu">
           <button
             type="button"
@@ -56,7 +59,7 @@ export function DeckStackCard({
             onClick={(event) => {
               event.stopPropagation();
               hoverPreview?.hide();
-              onToggleMenu();
+              onToggleMenu?.();
             }}
             aria-haspopup="menu"
             aria-expanded={isMenuOpen}

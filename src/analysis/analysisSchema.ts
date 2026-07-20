@@ -1,4 +1,4 @@
-import { DeckSnapshot } from "../deck/deckModel";
+import { DeckEntry, DeckSnapshot } from "../deck/deckModel";
 import { DeckGraph } from "../deck/deckGraph";
 import { DeckQuery, DeckQueryCapability } from "../deck/deckQueries";
 
@@ -24,6 +24,12 @@ export type CardGraphAnalysisInput = {
   graph: DeckGraph;
   cardId: string;
   availableQueries: DeckQueryCapability[];
+  prompt?: string;
+};
+
+export type CardGraphLiteAnalysisInput = {
+  deckId: string;
+  card: DeckEntry;
   prompt?: string;
 };
 
@@ -140,6 +146,9 @@ export type AnalysisResult = {
   subjectGraphNodeId?: string;
   title: string;
   summary?: string;
+  generationTimeMs?: number;
+  promptText?: string;
+  reasoningSummary?: string;
   layout: AnalysisLayoutNode;
   evidence?: EvidenceItem[];
   suggestedCardMemory?: CardMemory[];

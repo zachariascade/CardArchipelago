@@ -1,5 +1,5 @@
 import { DeckEntry, DeckSnapshot, getManaValue, getOracleText, getPrimaryTypeLine } from "../deck/deckModel";
-import { DeckGraphPatch, generateCardGraphPatch, generateDeckGraphPatch } from "../deck/deckGraph";
+import { DeckGraphPatch, generateCardGraphLitePatch, generateCardGraphPatch, generateDeckGraphPatch } from "../deck/deckGraph";
 import {
   availableQueries,
   countQuery,
@@ -10,7 +10,15 @@ import {
   type DeckQuery,
 } from "../deck/deckQueries";
 import { AnalysisProvider } from "./AnalysisProvider";
-import { AnalysisResult, CardAnalysisInput, CardGraphAnalysisInput, DeckAnalysisInput, DeckGraphAnalysisInput, FreeformDeckQuestionInput } from "./analysisSchema";
+import {
+  AnalysisResult,
+  CardAnalysisInput,
+  CardGraphAnalysisInput,
+  CardGraphLiteAnalysisInput,
+  DeckAnalysisInput,
+  DeckGraphAnalysisInput,
+  FreeformDeckQuestionInput,
+} from "./analysisSchema";
 
 type SemanticBucket = {
   id: string;
@@ -130,6 +138,7 @@ const OBJECTIVE_THEMES = [
 
 export class MockAnalysisProvider implements AnalysisProvider {
   async analyzeDeck(input: DeckAnalysisInput): Promise<AnalysisResult> {
+    const startedAt = performance.now();
     const { deck } = input;
     const commander = getCommander(deck);
     const buckets = analyzeBuckets(deck);
@@ -148,6 +157,13 @@ export class MockAnalysisProvider implements AnalysisProvider {
       summary: commander
         ? `${commander.name} leads a ${summarizeIdentity(commander)} list with ${deck.entries.length} unique cards loaded.`
         : `This Commander deck has ${deck.entries.length} unique cards loaded.`,
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeMockPrompt("Analyze deck", deck.name),
+      reasoningSummary: [
+        "1. Identified the commander and counted the deck's main structural groups.",
+        "2. Scanned card text and type lines for repeated synergy themes such as ramp, draw, interaction, tokens, and graveyard play.",
+        "3. Built query-backed groups, charts, and evidence items from the strongest detected themes.",
+      ].join("\n"),
       layout: {
         type: "stack",
         children: [
@@ -229,6 +245,7 @@ export class MockAnalysisProvider implements AnalysisProvider {
   }
 
   async analyzeCard(input: CardAnalysisInput): Promise<AnalysisResult> {
+    const startedAt = performance.now();
     const { deck, cardId } = input;
     const card = getCardById(deck, cardId);
     if (!card) throw new Error("Card was not found in the current deck.");
@@ -267,6 +284,13 @@ export class MockAnalysisProvider implements AnalysisProvider {
       subjectCardId: cardId,
       title: card.name,
       summary: `${card.name} is a ${typeLine || "card"} in this deck. This pass checks role, deck support, and query-backed related cards.`,
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeMockPrompt("Analyze card", `${card.name} in ${deck.name}`),
+      reasoningSummary: [
+        `1. Read ${card.name}'s type line and rules text to infer its likely role.`,
+        "2. Matched that role against deck-wide semantic buckets and related live queries.",
+        "3. Returned the strongest supporting groups and evidence links for the selected card.",
+      ].join("\n"),
       layout: {
         type: "stack",
         children: [
@@ -316,16 +340,28 @@ export class MockAnalysisProvider implements AnalysisProvider {
     return generateCardGraphPatch(input.deck, input.graph, input.cardId, input.prompt);
   }
 
+  async analyzeCardGraphLite(input: CardGraphLiteAnalysisInput): Promise<DeckGraphPatch> {
+    return generateCardGraphLitePatch(input.deckId, input.card, input.prompt);
+  }
+
   async analyzeDeckGraph(input: DeckGraphAnalysisInput): Promise<DeckGraphPatch> {
     return generateDeckGraphPatch(input.deck, input.graph, input.prompt);
   }
 
   async answerQuestion(input: FreeformDeckQuestionInput): Promise<AnalysisResult> {
+    const startedAt = performance.now();
     return {
       id: createAnalysisId("question"),
       kind: "freeform",
       title: "Mock Answer",
       summary: input.question,
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeMockPrompt("Answer deck question", input.question),
+      reasoningSummary: [
+        "1. Took the user's question as the main objective.",
+        "2. Considered the current deck snapshot and available query capabilities.",
+        "3. Returned a compact placeholder answer with evidence showing what the app sent to the provider.",
+      ].join("\n"),
       layout: {
         type: "stack",
         children: [
@@ -355,6 +391,14 @@ function analyzeBuckets(deck: DeckSnapshot): BucketResult[] {
       cardIds: matches.map((entry) => entry.id),
     };
   }).sort((a, b) => b.count - a.count);
+}
+
+function makeMockPrompt(task: string, subject: string): string {
+  return [
+    `Task: ${task}`,
+    `Subject: ${subject}`,
+    "Use the current deck snapshot, available query helpers, and card text to return a structured AnalysisResult with evidence-backed sections.",
+  ].join("\n");
 }
 
 function getObjectiveThemes(deck: DeckSnapshot): { theme: string; count: number; query: DeckQuery }[] {

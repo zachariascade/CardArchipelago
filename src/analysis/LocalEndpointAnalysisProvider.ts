@@ -1,6 +1,6 @@
 import { AnalysisProvider } from "./AnalysisProvider";
 import { DeckGraphPatch } from "../deck/deckGraph";
-import { AnalysisResult, CardAnalysisInput, CardGraphAnalysisInput, DeckAnalysisInput, DeckGraphAnalysisInput, FreeformDeckQuestionInput } from "./analysisSchema";
+import { AnalysisResult, CardAnalysisInput, CardGraphAnalysisInput, CardGraphLiteAnalysisInput, DeckAnalysisInput, DeckGraphAnalysisInput, FreeformDeckQuestionInput } from "./analysisSchema";
 import { validateDeckGraphPatch } from "./graphPatchValidation";
 import { validateAnalysisResult } from "./analysisValidation";
 
@@ -26,6 +26,10 @@ export class LocalEndpointAnalysisProvider implements AnalysisProvider {
 
   analyzeCardGraph(input: CardGraphAnalysisInput): Promise<DeckGraphPatch> {
     return this.postGraphPatch("analyzeCardGraph", input);
+  }
+
+  analyzeCardGraphLite(input: CardGraphLiteAnalysisInput): Promise<DeckGraphPatch> {
+    return this.postGraphPatch("analyzeCardGraphLite", input);
   }
 
   answerQuestion(input: FreeformDeckQuestionInput): Promise<AnalysisResult> {

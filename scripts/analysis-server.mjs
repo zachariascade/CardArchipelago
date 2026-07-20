@@ -52,9 +52,24 @@ server.listen(PORT, "127.0.0.1", () => {
 });
 
 async function runCodexAnalysis(request) {
+  const startedAt = performance.now();
   const { action, input, options } = request ?? {};
-  if (!["analyzeDeck", "analyzeCard", "analyzeDeckGraph", "analyzeCardGraph", "answerQuestion"].includes(action)) {
+  if (!["analyzeDeck", "analyzeCard", "analyzeDeckGraph", "analyzeCardGraph", "analyzeCardGraphLite", "answerQuestion"].includes(action)) {
     throw new Error("Invalid action.");
+  }
+
+  if (action === "analyzeCardGraphLite") {
+    if (!input?.deckId || !input?.card?.id) {
+      throw new Error("Request input must include deckId and a selected card.");
+    }
+    if (RUNNER === "codex") {
+      return runCodexExecAnalysis(action, input, options);
+    }
+    return attachGraphPatchRunMetadata(makeCardGraphLitePatch(input.deckId, input.card, input.prompt), {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeScaffoldPromptText(action, input),
+      reasoningSummary: graphPatchReasoningFallback(action),
+    });
   }
 
   const deck = input?.deck;
@@ -67,27 +82,45 @@ async function runCodexAnalysis(request) {
   }
 
   if (action === "analyzeDeckGraph") {
-    return makeDeckGraphPatch(deck, input.graph, input.prompt);
+    return attachGraphPatchRunMetadata(makeDeckGraphPatch(deck, input.graph, input.prompt), {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeScaffoldPromptText(action, input),
+      reasoningSummary: graphPatchReasoningFallback(action),
+    });
   }
 
   if (action === "analyzeCardGraph") {
-    return makeCardGraphPatch(deck, input.cardId, input.graph, input.prompt);
+    return attachGraphPatchRunMetadata(makeCardGraphPatch(deck, input.cardId, input.graph, input.prompt), {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeScaffoldPromptText(action, input),
+      reasoningSummary: graphPatchReasoningFallback(action),
+    });
   }
 
   if (action === "analyzeCard") {
     const card = deck.entries.find((entry) => entry.id === input.cardId);
     if (!card) throw new Error("Card id was not found in deck snapshot.");
-    return makeCardAnalysis(deck, card);
+    return attachAnalysisRunMetadata(makeCardAnalysis(deck, card), {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeScaffoldPromptText(action, input),
+    });
   }
 
   if (action === "answerQuestion") {
-    return makeQuestionAnalysis(deck, input.question ?? "");
+    return attachAnalysisRunMetadata(makeQuestionAnalysis(deck, input.question ?? ""), {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: makeScaffoldPromptText(action, input),
+    });
   }
 
-  return makeDeckAnalysis(deck);
+  return attachAnalysisRunMetadata(makeDeckAnalysis(deck), {
+    generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    promptText: makeScaffoldPromptText(action, input),
+  });
 }
 
 async function runCodexExecAnalysis(action, input, options = {}) {
+  const startedAt = performance.now();
   const workDir = await mkdtemp(join(tmpdir(), "mtg-analysis-"));
   const outputPath = join(workDir, "analysis-result.json");
   const codexModel = normalizeCodexModel(options.codexModel) ?? DEFAULT_CODEX_MODEL;
@@ -110,6 +143,11 @@ async function runCodexExecAnalysis(action, input, options = {}) {
     if (action === "analyzeCardGraph") {
       console.log(
         `Card graph prompt size for ${input?.cardId ?? "unknown"}: ${promptUsage.promptChars.toLocaleString()} prompt chars + ${promptUsage.contextFileChars.toLocaleString()} context-file chars, ~${(promptUsage.promptTokensEstimate + promptUsage.contextFileTokensEstimate).toLocaleString()} input tokens.`,
+      );
+    }
+    if (action === "analyzeCardGraphLite") {
+      console.log(
+        `Card graph lite prompt size for ${input?.card?.id ?? "unknown"}: ${promptUsage.promptChars.toLocaleString()} prompt chars + ${promptUsage.contextFileChars.toLocaleString()} context-file chars, ~${(promptUsage.promptTokensEstimate + promptUsage.contextFileTokensEstimate).toLocaleString()} input tokens.`,
       );
     }
     const codexArgs = [
@@ -146,11 +184,19 @@ async function runCodexExecAnalysis(action, input, options = {}) {
       }
       throw error;
     }
-    if (action === "analyzeDeckGraph" || action === "analyzeCardGraph") {
+    if (action === "analyzeDeckGraph" || action === "analyzeCardGraph" || action === "analyzeCardGraphLite") {
       const reportedUsage = parseReportedTokenUsage(`${commandResult.stdout}\n${commandResult.stderr}`);
-      return normalizeGraphPatch(parsed, input, makeGraphPatchUsage(promptUsage, raw, reportedUsage));
+      return normalizeGraphPatch(parsed, input, makeGraphPatchUsage(promptUsage, raw, reportedUsage), {
+        generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+        promptText: prompt,
+        reasoningSummary: graphPatchReasoningFallback(action),
+      });
     }
-    return normalizeAnalysisResult(parsed);
+    return normalizeAnalysisResult(parsed, {
+      generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      promptText: prompt,
+      reasoningSummary: resultReasoningFallback(action),
+    });
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -176,6 +222,13 @@ function normalizeCodexReasoningEffort(value) {
 }
 
 async function buildCodexPrompt(action, input, workDir) {
+  if (action === "analyzeCardGraphLite") {
+    return {
+      prompt: buildCardGraphLitePatchPrompt(input, compactDeckEntry(input.card, undefined)),
+      contextFileChars: 0,
+    };
+  }
+
   const deck = compactDeck(input.deck, { omitEntryId: action === "analyzeCardGraph" ? input.cardId : undefined });
   const selectedCardDeck = action === "analyzeCard" || action === "analyzeCardGraph" ? compactDeck(input.deck).entries.find((entry) => entry.id === input.cardId) : undefined;
   if (action === "analyzeDeckGraph") {
@@ -211,6 +264,7 @@ Your task is descriptive and evidence-backed:
 - The response is transient in the app and will not be saved; still return one complete AnalysisResult JSON object.
 - Evidence items may ONLY use: claim, cardIds, query, note.
 - Do not use evidence fields named detail, reason, sourceText, explanation, or cards.
+- Include reasoningSummary as a brief, user-facing step plan for how you produced the result. Summarize your approach without hidden chain-of-thought.
 
 Allowed AnalysisResult shape:
 {
@@ -219,6 +273,7 @@ Allowed AnalysisResult shape:
   "subjectCardId"?: string,
   "title": string,
   "summary"?: string,
+  "reasoningSummary"?: string,
   "layout": AnalysisLayoutNode,
   "evidence"?: EvidenceItem[],
   "createdAt": ISO string,
@@ -380,6 +435,7 @@ Rules:
 - Keep edges high-signal. Usually 3-12 edges is enough.
 - Every edge should have evidence.
 - Do not recommend cuts or upgrades.
+- reasoningSummary must be a concise execution log, not a generic description. Write 2-6 short bullet lines naming what you noticed and what graph operations you made, for example: "- looked at Heidegger, noted Soldier payoff", "- made edgeFunction for Soldier creatures enabling Heidegger", "- added direct edge to Terra because it creates the payoff condition". Do not reveal hidden chain-of-thought; summarize observable steps and graph edits.
 
 Allowed node kind: "card" | "package" | "strategy" | "resource" | "risk"
 Allowed edge kind: "supports" | "enables" | "pays_off" | "protects" | "answers" | "depends_on" | "weak_to" | "belongs_to"
@@ -391,6 +447,7 @@ Required DeckGraphPatch shape:
   "id": string,
   "deckId": "${deck.id}",
   "cardId": "${input.cardId}",
+  "reasoningSummary"?: string,
   "nodesToUpsert": [
     {
       "id": string,
@@ -446,6 +503,8 @@ Required DeckGraphPatch shape:
     }
   ],
   "edgeIdsToRemove"?: string[],
+  "generationTimeMs"?: number,
+  "promptText"?: string,
   "notes": string[],
   "generatedAt": ISO string,
   "source": "ai"
@@ -475,6 +534,92 @@ Read ${contextFiles.graphSummary}.
 
 Deck card pool:
 Read/search ${contextFiles.deckCardPool}. This file intentionally omits the selected card to avoid duplicating ${contextFiles.selectedCard}.
+
+Return the DeckGraphPatch JSON now.`;
+}
+
+function buildCardGraphLitePatchPrompt(input, selectedCard) {
+  const deckId = input.deckId;
+  const cardId = input.card?.id;
+  const customPrompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
+  return `You are an MTG Commander synergy graph analyst for a local deck explorer app.
+
+Return ONLY a single JSON object. Do not wrap it in markdown. Do not include commentary outside JSON.
+
+Your task: generate a LITE card-level graph patch for the selected card.
+
+Important constraints:
+- You only have the selected card. Do not assume or use deck card pool, current graph context, related graph context, or deck strategy.
+- Return edgeFunctions only. Set nodesToUpsert to [] and edgesToUpsert to [].
+- Create edgeFunctions only when they can be inferred from the selected card's own type line and rules text.
+- Prefer no edgeFunction over an overbroad or speculative one.
+- Use sourceId "card:${cardId}" + selector when the selected card creates, rewards, supports, protects, answers, or depends on matching cards.
+- Use sourceSelector + targetId "card:${cardId}" when matching cards enable/support/protect the selected card.
+- Edge kind is a machine-readable semantic hint. Use connectionGroup for the expressive visible relationship label.
+- If a custom prompt is provided, satisfy it only when the selected card alone supports it.
+- Do not recommend cuts or upgrades.
+- reasoningSummary must be a concise execution log, not a generic description. Write 2-6 short bullet lines naming what you noticed and what graph operations you made, for example: "- looked at Heidegger, noted Soldier payoff", "- made edgeFunction for Soldier creatures enabling Heidegger". Do not reveal hidden chain-of-thought; summarize observable steps and graph edits.
+
+Allowed node kind: "card" | "package" | "strategy" | "resource" | "risk"
+Allowed edge kind: "supports" | "enables" | "pays_off" | "protects" | "answers" | "depends_on" | "weak_to" | "belongs_to"
+Allowed strength: 1 | 2 | 3 | 4 | 5
+
+Edge function selector reference:
+${COMPACT_EDGE_FUNCTION_ATTRIBUTE_REFERENCE}
+
+Required DeckGraphPatch shape:
+{
+  "id": string,
+  "deckId": "${deckId}",
+  "cardId": "${cardId}",
+  "reasoningSummary"?: string,
+  "nodesToUpsert": [],
+  "edgesToUpsert": [],
+  "edgeFunctions": [
+    {
+      "id": string,
+      "sourceId"?: string,
+      "targetId"?: string,
+      "kind": "supports" | "enables" | "pays_off" | "protects" | "answers" | "depends_on" | "weak_to" | "belongs_to",
+      "selector"?: {
+        "attributes"?: [
+          {
+            "path": string,
+            "op": "exists" | "equals" | "notEquals" | "contains" | "notContains" | "includes" | "notIncludes" | ">" | ">=" | "<" | "<=",
+            "value"?: string | number | boolean | string[] | number[]
+          }
+        ]
+      },
+      "sourceSelector"?: {
+        "attributes"?: [
+          {
+            "path": string,
+            "op": "exists" | "equals" | "notEquals" | "contains" | "notContains" | "includes" | "notIncludes" | ">" | ">=" | "<" | "<=",
+            "value"?: string | number | boolean | string[] | number[]
+          }
+        ]
+      },
+      "customMessage": string,
+      "strength": 1 | 2 | 3 | 4 | 5,
+      "connectionGroup"?: string
+    }
+  ],
+  "edgeIdsToRemove"?: [],
+  "generationTimeMs"?: number,
+  "promptText"?: string,
+  "notes": string[],
+  "generatedAt": ISO string,
+  "source": "ai"
+}
+
+Edge function id format:
+Use "fn:${cardId}:<short-slug>".
+
+Selected card:
+${JSON.stringify(selectedCard)}
+
+Custom user prompt:
+${customPrompt || "(none)"}
 
 Return the DeckGraphPatch JSON now.`;
 }
@@ -533,6 +678,7 @@ Required DeckGraphPatch shape:
 {
   "id": string,
   "deckId": "${deck.id}",
+  "reasoningSummary"?: string,
   "nodesToUpsert": [
     {
       "id": string,
@@ -565,6 +711,8 @@ Required DeckGraphPatch shape:
     }
   ],
   "edgeIdsToRemove"?: [],
+  "generationTimeMs"?: number,
+  "promptText"?: string,
   "notes": string[],
   "generatedAt": ISO string,
   "source": "ai"
@@ -860,13 +1008,65 @@ function parseCodexJson(raw) {
   }
 }
 
-function normalizeAnalysisResult(result) {
+function normalizeAnalysisResult(result, runMetadata = {}) {
+  const reasoningSummary = typeof result.reasoningSummary === "string" && result.reasoningSummary.trim()
+    ? result.reasoningSummary
+    : runMetadata.reasoningSummary;
   return {
     ...result,
     source: "codex-local",
     createdAt: result.createdAt ?? new Date().toISOString(),
+    generationTimeMs: typeof result.generationTimeMs === "number" ? result.generationTimeMs : runMetadata.generationTimeMs,
+    promptText: typeof result.promptText === "string" && result.promptText.trim() ? result.promptText : runMetadata.promptText,
+    reasoningSummary,
     layout: normalizeLayoutNode(result.layout),
   };
+}
+
+function attachAnalysisRunMetadata(result, runMetadata = {}) {
+  return {
+    ...result,
+    generationTimeMs: typeof result.generationTimeMs === "number" ? result.generationTimeMs : runMetadata.generationTimeMs,
+    promptText: typeof result.promptText === "string" && result.promptText.trim() ? result.promptText : runMetadata.promptText,
+    reasoningSummary:
+      typeof result.reasoningSummary === "string" && result.reasoningSummary.trim()
+        ? result.reasoningSummary
+        : runMetadata.reasoningSummary ?? resultReasoningFallback(result.kind ?? "analysis"),
+  };
+}
+
+function makeScaffoldPromptText(action, input) {
+  return [
+    `Action: ${action}`,
+    input?.cardId || input?.card?.id ? `Selected card id: ${input.cardId ?? input.card.id}` : undefined,
+    input?.question ? `Question: ${input.question}` : undefined,
+    `Deck: ${input?.deck?.name ?? input?.deckId ?? "Untitled deck"}`,
+    action === "analyzeCardGraphLite"
+      ? "Use only the selected card to return a DeckGraphPatch with edgeFunctions only."
+      : "Use the deck snapshot and query capabilities to return a structured AnalysisResult.",
+  ].filter(Boolean).join("\n");
+}
+
+function resultReasoningFallback(action) {
+  if (action === "analyzeCard" || action === "card-analysis") {
+    return [
+      "1. Read the selected card's rules text and type line.",
+      "2. Matched that card against visible deck themes and query-backed support groups.",
+      "3. Built the result from the strongest role, support, and evidence signals.",
+    ].join("\n");
+  }
+  if (action === "answerQuestion" || action === "freeform") {
+    return [
+      "1. Interpreted the user question as the main target.",
+      "2. Checked the deck snapshot and available query capabilities for supporting evidence.",
+      "3. Returned a focused answer with layout sections suited to the question.",
+    ].join("\n");
+  }
+  return [
+    "1. Read the deck snapshot and commander context.",
+    "2. Looked for repeated card text, type-line patterns, and query-backed synergy packages.",
+    "3. Organized the strongest signals into the rendered analysis and evidence sections.",
+  ].join("\n");
 }
 
 function makeGraphPatchUsage(promptUsage, rawOutput, reportedUsage) {
@@ -904,11 +1104,11 @@ function parseTokenNumber(value) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-function normalizeGraphPatch(result, input, usage) {
+function normalizeGraphPatch(result, input, usage, runMetadata = {}) {
   const now = new Date().toISOString();
-  const deckId = input?.deck?.id ?? result.deckId;
-  const cardId = input?.cardId ?? result.cardId;
-  return {
+  const deckId = input?.deck?.id ?? input?.deckId ?? result.deckId;
+  const cardId = input?.cardId ?? input?.card?.id ?? result.cardId;
+  const patch = {
     id: result.id ?? `patch_${cardId ?? deckId}_${Date.now()}`,
     deckId,
     ...(cardId ? { cardId } : {}),
@@ -927,12 +1127,75 @@ function normalizeGraphPatch(result, input, usage) {
       ...edgeFunction,
       strength: clampPatchStrength(edgeFunction.strength),
     })),
+    nodeIdsToRemove: result.nodeIdsToRemove ?? [],
     edgeIdsToRemove: result.edgeIdsToRemove ?? [],
     usage: result.usage ?? usage,
+    generationTimeMs: typeof result.generationTimeMs === "number" ? result.generationTimeMs : runMetadata.generationTimeMs,
+    promptText: typeof result.promptText === "string" && result.promptText.trim() ? result.promptText : runMetadata.promptText,
+    reasoningSummary:
+      typeof result.reasoningSummary === "string" && result.reasoningSummary.trim()
+        ? result.reasoningSummary
+        : runMetadata.reasoningSummary,
     notes: result.notes ?? [],
     generatedAt: result.generatedAt ?? now,
     source: "ai",
   };
+  return attachGraphPatchRunMetadata(patch, runMetadata);
+}
+
+function attachGraphPatchRunMetadata(result, runMetadata = {}) {
+  const reasoningSummary =
+    typeof result.reasoningSummary === "string" && result.reasoningSummary.trim()
+      ? result.reasoningSummary
+      : summarizeGraphPatchExecution(result, runMetadata.reasoningSummary);
+  return {
+    ...result,
+    generationTimeMs: typeof result.generationTimeMs === "number" ? result.generationTimeMs : runMetadata.generationTimeMs,
+    promptText: typeof result.promptText === "string" && result.promptText.trim() ? result.promptText : runMetadata.promptText,
+    reasoningSummary,
+  };
+}
+
+function summarizeGraphPatchExecution(patch, fallback) {
+  const lines = [];
+  if (patch.cardId) lines.push(`- looked at selected card ${patch.cardId} as the graph focus`);
+  else lines.push(`- looked across deck ${patch.deckId} for graph groups`);
+  (patch.nodesToUpsert ?? []).filter((node) => node.kind !== "card").slice(0, 3).forEach((node) => {
+    lines.push(`- made ${node.kind} node "${node.label}"`);
+  });
+  (patch.edgesToUpsert ?? []).slice(0, 4).forEach((edge) => {
+    const group = edge.connectionGroup ? ` (${edge.connectionGroup})` : "";
+    lines.push(`- added ${edge.kind}${group} edge ${edge.sourceId} -> ${edge.targetId}`);
+  });
+  (patch.edgeFunctions ?? []).slice(0, 4).forEach((edgeFunction) => {
+    const direction = edgeFunction.targetId ? `to ${edgeFunction.targetId}` : edgeFunction.sourceId ? `from ${edgeFunction.sourceId}` : "for matching cards";
+    const group = edgeFunction.connectionGroup ? ` in "${edgeFunction.connectionGroup}"` : "";
+    lines.push(`- made edgeFunction ${edgeFunction.id} ${direction}${group}`);
+  });
+  (patch.notes ?? []).slice(0, 3).forEach((note) => lines.push(`- noted ${note}`));
+  return lines.length ? Array.from(new Set(lines)).slice(0, 8).join("\n") : fallback;
+}
+
+function graphPatchReasoningFallback(action) {
+  if (action === "analyzeCardGraphLite") {
+    return [
+      "- looked at the selected card by itself",
+      "- skipped deck pool and graph context",
+      "- returned only reusable edgeFunctions inferred from that card",
+    ].join("\n");
+  }
+  if (action === "analyzeCardGraph") {
+    return [
+      "1. Read the selected card and nearby graph context as the analysis target.",
+      "2. Compared the card against the deck card pool and existing graph relationships.",
+      "3. Returned the highest-signal nodes, direct edges, and selector functions as a graph patch.",
+    ].join("\n");
+  }
+  return [
+    "1. Read the deck card pool and current graph summary.",
+    "2. Looked for broad package and strategy patterns that can be represented as graph groups.",
+    "3. Returned reusable deck-level nodes and selector functions as a graph patch.",
+  ].join("\n");
 }
 
 function clampPatchStrength(value) {
@@ -1295,6 +1558,158 @@ function makeDeckGraphPatch(deck, graph, prompt) {
       ...groups.map((group) => `${group.label}: ${group.cards.length} card${group.cards.length === 1 ? "" : "s"} found.`),
       ...(customPrompt ? [`Custom prompt considered: ${customPrompt}`] : []),
     ],
+    generatedAt: new Date().toISOString(),
+    source: "ai",
+  };
+}
+
+function makeCardGraphLitePatch(deckId, card, prompt) {
+  const text = cardText(card);
+  const edgeFunctions = [];
+  const notes = [];
+  const sourceId = `card:${card.id}`;
+  const now = Date.now();
+  const customPrompt = typeof prompt === "string" ? prompt.trim() : "";
+  const addFunction = (edgeFunction, note) => {
+    if (edgeFunctions.some((item) => item.id === edgeFunction.id)) return;
+    edgeFunctions.push(edgeFunction);
+    notes.push(note);
+  };
+
+  if (text.includes("whenever you cast a noncreature spell")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:noncreature-spells`,
+        sourceId,
+        kind: "pays_off",
+        selector: {
+          attributes: [
+            { path: "card.is_nonland", op: "equals", value: true },
+            { path: "card.type_line_all", op: "notContains", value: "Creature" },
+          ],
+        },
+        customMessage: `${card.name} rewards casting this noncreature spell.`,
+        strength: 5,
+      },
+      `${card.name} has a noncreature-spell payoff.`,
+    );
+  }
+
+  if (text.includes("four or more wizards") || (text.includes("wizard") && text.includes("transform"))) {
+    addFunction(
+      {
+        id: `fn:${card.id}:wizard-threshold`,
+        targetId: sourceId,
+        kind: "enables",
+        sourceSelector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Wizard" }] },
+        customMessage: `This Wizard helps ${card.name} reach its Wizard threshold.`,
+        strength: 4,
+      },
+      `${card.name} has a Wizard threshold or transform condition.`,
+    );
+  }
+
+  if (text.includes("soldier")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:soldiers`,
+        sourceId,
+        kind: text.includes("whenever") || text.includes("gets") || text.includes("tokens you control") ? "pays_off" : "supports",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Soldier" }] },
+        customMessage: `${card.name} has rules text that connects it to Soldier cards.`,
+        strength: 4,
+        connectionGroup: "Soldiers",
+      },
+      `${card.name} references Soldier cards or Soldier payoffs.`,
+    );
+  }
+
+  if (text.includes("artifact") && text.includes("graveyard")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:artifact-graveyard`,
+        sourceId,
+        kind: "enables",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Artifact" }] },
+        customMessage: `${card.name} specifically references artifact cards in the graveyard.`,
+        strength: 5,
+        connectionGroup: "Artifact recursion",
+      },
+      `${card.name} connects artifacts with graveyard access.`,
+    );
+  } else if (text.includes("artifact")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:artifacts`,
+        sourceId,
+        kind: "supports",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Artifact" }] },
+        customMessage: `${card.name} has rules text that connects it to artifact cards.`,
+        strength: 3,
+        connectionGroup: "Artifacts",
+      },
+      `${card.name} references artifacts.`,
+    );
+  }
+
+  if (text.includes("tokens you control") || text.includes("token")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:tokens`,
+        sourceId,
+        kind: text.includes("tokens you control") || text.includes("whenever") ? "pays_off" : "supports",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "token" }] },
+        customMessage: `${card.name} has token-relevant rules text.`,
+        strength: text.includes("tokens you control") ? 4 : 3,
+        connectionGroup: "Tokens",
+      },
+      `${card.name} references tokens.`,
+    );
+  }
+
+  if (text.includes("sacrifice")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:sacrifice`,
+        sourceId,
+        kind: "enables",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "dies" }] },
+        customMessage: `${card.name} can connect to cards that care about creatures or permanents dying.`,
+        strength: 4,
+        connectionGroup: "Sacrifice",
+      },
+      `${card.name} includes sacrifice text.`,
+    );
+  }
+
+  if (text.includes("graveyard")) {
+    addFunction(
+      {
+        id: `fn:${card.id}:graveyard`,
+        sourceId,
+        kind: "supports",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "graveyard" }] },
+        customMessage: `${card.name} has graveyard-relevant rules text.`,
+        strength: 3,
+        connectionGroup: "Graveyard",
+      },
+      `${card.name} references graveyards.`,
+    );
+  }
+
+  if (customPrompt) notes.push(`Custom prompt considered: ${customPrompt}`);
+
+  return {
+    id: `patch_${card.id}_lite_${now}`,
+    deckId,
+    cardId: card.id,
+    nodesToUpsert: [],
+    edgesToUpsert: [],
+    edgeFunctions,
+    edgeIdsToRemove: [],
+    notes: notes.length
+      ? notes
+      : [`${card.name} did not produce card-only edge functions from the local endpoint scaffold.`],
     generatedAt: new Date().toISOString(),
     source: "ai",
   };

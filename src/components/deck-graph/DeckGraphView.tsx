@@ -1,7 +1,8 @@
 import { Fragment, useMemo, useState } from "react";
 import type { PointerEvent, ReactNode } from "react";
-import { Brain, Eye, EyeOff, Minus, RotateCcw, ZoomIn } from "lucide-react";
+import { Brain, Eye, EyeOff, Minus, RotateCcw, Trash2, ZoomIn } from "lucide-react";
 import { AnalysisResult } from "../../analysis/analysisSchema";
+import { AnalysisRenderer } from "../analysis-renderer/AnalysisRenderer";
 import { getCardById } from "../../deck/deckQueries";
 import { DeckSnapshot, getImageUri, getPrimaryTypeLine } from "../../deck/deckModel";
 import {
@@ -106,6 +107,7 @@ export function DeckGraphView({
   onAnalyzeNode,
   onPromptAnalyzeNode,
   onHideNode,
+  onDeleteNode,
   onDeleteEdge,
   onDeleteEdges,
   onCopyConnectionsJson,
@@ -129,6 +131,7 @@ export function DeckGraphView({
   onAnalyzeNode?: (nodeId: string) => void;
   onPromptAnalyzeNode?: (nodeId: string, prompt: string) => void;
   onHideNode?: (nodeId: string) => void;
+  onDeleteNode?: (nodeId: string) => void;
   onDeleteEdge?: (edgeId: string) => void;
   onDeleteEdges?: (edgeIds: string[], label?: string) => void;
   onCopyConnectionsJson?: () => void;
@@ -167,6 +170,7 @@ export function DeckGraphView({
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? nodes[0];
   const selectedConnections = selectedNode ? getConnectedGraphItems(visibleGraph, selectedNode.id) : { nodes: [], edges: [] };
+  const selectedNodeAnalysis = latestAnalysis?.subjectGraphNodeId === selectedNode?.id ? latestAnalysis : undefined;
   const visibleEdges = visibleGraph.edges.filter((edge) => nodeById.has(edge.sourceId) && nodeById.has(edge.targetId));
   const cardNodeStyles = useMemo(() => getCardNodeStyles(deck, nodes), [deck, nodes]);
   const cardTypeGradients = nodes
@@ -369,11 +373,26 @@ export function DeckGraphView({
                 <p>{describeGraphNode(selectedNode, visibleGraph)}</p>
               </div>
 
-              {selectedNode.cardId && <GraphCardPreview deck={deck} cardId={selectedNode.cardId} onOpenCard={onOpenCard} />}
+              {selectedNode.cardId ? (
+                <GraphCardPreview deck={deck} cardId={selectedNode.cardId} onOpenCard={onOpenCard} />
+              ) : (
+                <GraphConceptNodeView
+                  deck={deck}
+                  node={selectedNode}
+                  connectedNodes={selectedConnections.nodes}
+                  connectedEdges={selectedConnections.edges}
+                  analysis={selectedNodeAnalysis}
+                  isAnalyzing={isAnalyzing}
+                  onAnalyzeNode={onAnalyzeNode}
+                  onDeleteNode={onDeleteNode}
+                  onOpenCard={onOpenCard}
+                  hoverPreview={hoverPreview}
+                />
+              )}
 
-              {(onAnalyzeNode || onPromptAnalyzeNode || onHideNode) && (
+              {(selectedNode.cardId || onHideNode) && (onAnalyzeNode || onPromptAnalyzeNode || onHideNode) && (
                 <div className="panel-actions">
-                  {onAnalyzeNode && (
+                  {onAnalyzeNode && selectedNode.cardId && (
                     <button type="button" className="primary-button" onClick={() => onAnalyzeNode(selectedNode.id)} disabled={isAnalyzing}>
                       <Brain size={16} />
                       {isAnalyzing ? "Analyzing..." : "Analyze Node"}
@@ -414,7 +433,7 @@ export function DeckGraphView({
 
               {connectionsPlacement === "inspector" && selectedConnectionsPanel}
 
-              {latestAnalysis && (
+              {latestAnalysis && !selectedNodeAnalysis && (
                 <div className="graph-analysis-note">
                   <span>Latest Analysis</span>
                   <strong>{latestAnalysis.title}</strong>
@@ -448,6 +467,85 @@ function GraphCardPreview({ deck, cardId, onOpenCard }: { deck: DeckSnapshot; ca
         <em>{getPrimaryTypeLine(card)}</em>
       </div>
     </button>
+  );
+}
+
+function GraphConceptNodeView({
+  deck,
+  node,
+  connectedNodes,
+  connectedEdges,
+  analysis,
+  isAnalyzing,
+  onAnalyzeNode,
+  onDeleteNode,
+  onOpenCard,
+  hoverPreview,
+}: {
+  deck: DeckSnapshot;
+  node: DeckGraphNode;
+  connectedNodes: DeckGraphNode[];
+  connectedEdges: DeckGraphEdge[];
+  analysis?: AnalysisResult;
+  isAnalyzing: boolean;
+  onAnalyzeNode?: (nodeId: string) => void;
+  onDeleteNode?: (nodeId: string) => void;
+  onOpenCard: (cardId: string) => void;
+  hoverPreview?: HoverPreviewHandlers;
+}) {
+  const connectedCards = connectedNodes.filter((item) => item.cardId).slice(0, 8);
+  const strongestEdges = [...connectedEdges].sort((a, b) => b.strength - a.strength).slice(0, 5);
+  return (
+    <section className="graph-concept-node-view">
+      <div className="graph-concept-node-summary">
+        <span>Node View</span>
+        <p>{node.summary}</p>
+        {connectedCards.length > 0 && (
+          <div className="graph-concept-card-list">
+            {connectedCards.map((item) => (
+              <button key={item.id} type="button" onClick={() => item.cardId && onOpenCard(item.cardId)}>
+                {item.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {strongestEdges.length > 0 && (
+          <ul className="graph-concept-edge-list">
+            {strongestEdges.map((edge) => (
+              <li key={edge.id}>
+                <strong>{edge.connectionGroup ?? edge.kind}</strong>
+                <span>{edge.evidence ?? `${edge.sourceId} -> ${edge.targetId}`}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="graph-concept-analysis-panel">
+        <div className="graph-concept-analysis-heading">
+          <span>Generated Explanation</span>
+          <div className="graph-concept-actions">
+            {onAnalyzeNode && (
+              <button type="button" className="primary-button" onClick={() => onAnalyzeNode(node.id)} disabled={isAnalyzing}>
+                <Brain size={16} />
+                {isAnalyzing ? "Generating..." : analysis ? "Refresh Explanation" : "Generate Explanation"}
+              </button>
+            )}
+            {onDeleteNode && (
+              <button type="button" className="secondary-button danger-button" onClick={() => onDeleteNode(node.id)}>
+                <Trash2 size={16} />
+                Delete Node
+              </button>
+            )}
+          </div>
+        </div>
+        {analysis ? (
+          <AnalysisRenderer deck={deck} analysis={analysis} onSelectCard={onOpenCard} hoverPreview={hoverPreview} />
+        ) : (
+          <p className="graph-concept-empty">Generate an explanation to describe what this node does, which cards support it, and what to inspect next.</p>
+        )}
+      </div>
+    </section>
   );
 }
 

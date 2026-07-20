@@ -8,14 +8,16 @@ import { DeckGraphView } from "../components/deck-graph/DeckGraphView";
 import { DeckGrid, FilterMode, SortMode } from "../components/deck-grid/DeckGrid";
 import { DEFAULT_DECKLIST, ImportPanel } from "../components/import/ImportPanel";
 import { UnresolvedResolverPanel } from "../components/unresolved-resolver/UnresolvedResolverPanel";
+import { ArchidektImport, fetchArchidektDeck } from "../deck/archidekt";
 import { DeckBoard, DeckEntry, DeckSnapshot, ScryfallCard, getImageUri, getPrimaryTypeLine } from "../deck/deckModel";
-import { DeckGraph, DeckGraphPatch, applyGraphPatches, buildDeckGraph, normalizeDeckGraphEdgeId } from "../deck/deckGraph";
+import { DeckGraph, DeckGraphPatch, applyGraphPatches, buildDeckGraph, getConnectedGraphItems, normalizeDeckGraphEdgeId } from "../deck/deckGraph";
 import { availableQueries, getCardById, getCommander } from "../deck/deckQueries";
-import { parseDecklist } from "../deck/parseDecklist";
+import { ParsedDecklist, parseDecklist } from "../deck/parseDecklist";
 import { fetchCardAutocompleteNames, fetchFuzzyCardByName, hydrateDeckEntries, slugify } from "../deck/scryfall";
 import { ProviderConfig, QuestionThread, StoredDeckGraphState, loadStoredState, saveStoredState } from "../storage/localDeckStorage";
 
 const EDGE_DELETIONS_PATCH_KEY = "__edge_deletions__";
+const NODE_DELETIONS_PATCH_KEY = "__node_deletions__";
 const DECK_ANALYSIS_PATCH_KEY = "__deck_analysis__";
 
 export type HoverPreviewHandlers = {
@@ -31,6 +33,7 @@ type CardPreviewState = {
 
 export function App() {
   const [deckText, setDeckText] = useState(DEFAULT_DECKLIST);
+  const [archidektUrl, setArchidektUrl] = useState("");
   const [decks, setDecks] = useState<DeckSnapshot[]>([]);
   const [activeDeckId, setActiveDeckId] = useState<string | undefined>();
   const [selectedCardId, setSelectedCardId] = useState<string | undefined>();
@@ -49,10 +52,13 @@ export function App() {
   const [unresolvedNames, setUnresolvedNames] = useState<string[]>([]);
   const [importMessage, setImportMessage] = useState<string>();
   const [isImporting, setIsImporting] = useState(false);
+  const [isImportingArchidekt, setIsImportingArchidekt] = useState(false);
+  const [isSyncingArchidekt, setIsSyncingArchidekt] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isAnalyzingDeckGraph, setIsAnalyzingDeckGraph] = useState(false);
   const [deckGraphPatchStatus, setDeckGraphPatchStatus] = useState<string>();
   const [deckGraphPatchError, setDeckGraphPatchError] = useState<string>();
+  const [deckGraphPrompt, setDeckGraphPrompt] = useState("");
   const [graphAnalyzingCardId, setGraphAnalyzingCardId] = useState<string>();
   const [questionText, setQuestionText] = useState("");
   const [questionError, setQuestionError] = useState<string>();
@@ -127,7 +133,9 @@ export function App() {
   const analyses = deck ? analysesByDeckId[deck.id] ?? [] : [];
   const activeGraphState = deck ? graphStateByDeckId[deck.id] ?? {} : {};
   const deckGraphPatches = useMemo(() => (deck ? Object.values(graphPatchesByDeckId[deck.id] ?? {}) : []), [deck, graphPatchesByDeckId]);
-  const deckGraphPatchCount = deck ? Object.keys(graphPatchesByDeckId[deck.id] ?? {}).filter((key) => key !== EDGE_DELETIONS_PATCH_KEY).length : 0;
+  const deckGraphPatchCount = deck
+    ? Object.keys(graphPatchesByDeckId[deck.id] ?? {}).filter((key) => key !== EDGE_DELETIONS_PATCH_KEY && key !== NODE_DELETIONS_PATCH_KEY).length
+    : 0;
   const deckAnalysisGraphPatch = deck ? graphPatchesByDeckId[deck.id]?.[DECK_ANALYSIS_PATCH_KEY] : undefined;
   const deckGraph = useMemo(() => (deck ? applyGraphPatches(buildDeckGraph(deck), deckGraphPatches, deck) : undefined), [deck, deckGraphPatches]);
   const modalCard = deck && modalCardId ? getCardById(deck, modalCardId) : undefined;
@@ -184,36 +192,115 @@ export function App() {
     setUnresolvedNames([]);
     try {
       const parsed = parseDecklist(deckText);
-      setWarnings(parsed.warnings);
-      setImportMessage("Fetching Scryfall card data...");
-      const result = await hydrateDeckEntries(parsed);
-      setUnresolvedNames(result.unresolvedNames);
-      const commanderEntry = findCommander(result.entries, parsed.commanderName);
-      const now = new Date().toISOString();
-      const nextDeck: DeckSnapshot = {
-        id: `deck_${Date.now()}`,
-        name: commanderEntry ? `${commanderEntry.name} Deck` : "Imported Commander Deck",
-        format: "commander",
+      await importParsedDeck({
+        parsed,
         originalText: deckText,
-        commanderId: commanderEntry?.id,
-        entries: result.entries,
-        importedAt: now,
-        updatedAt: now,
-      };
-      if (!commanderEntry) {
-        const candidates = findCommanderCandidates(result.entries);
-        if (candidates.length > 0) {
-          setPendingImport({ deck: nextDeck, candidates });
-          setImportMessage("Choose the commander to finish import.");
-          return;
-        }
-      }
-      saveImportedDeck(nextDeck, commanderEntry?.id ?? result.entries[0]?.id);
-      setImportMessage(`Imported ${result.entries.length} unique card${result.entries.length === 1 ? "" : "s"}.`);
+        deckName: "Imported Commander Deck",
+        inferredNameFromCommander: true,
+      });
     } catch (error) {
       setImportMessage(error instanceof Error ? error.message : "Import failed.");
     } finally {
       setIsImporting(false);
+    }
+  }
+
+  async function importArchidektDeck() {
+    setIsImportingArchidekt(true);
+    setImportMessage("Fetching Archidekt deck...");
+    setWarnings([]);
+    setUnresolvedNames([]);
+    try {
+      const imported = await fetchArchidektDeck(archidektUrl);
+      setDeckText(imported.originalText);
+      await importParsedDeck({
+        parsed: imported.parsed,
+        originalText: imported.originalText,
+        deckName: imported.name,
+        source: makeArchidektSource(imported),
+      });
+      setArchidektUrl(imported.url);
+    } catch (error) {
+      setImportMessage(error instanceof Error ? error.message : "Archidekt import failed.");
+    } finally {
+      setIsImportingArchidekt(false);
+    }
+  }
+
+  async function importParsedDeck({
+    parsed,
+    originalText,
+    deckName,
+    source,
+    inferredNameFromCommander = false,
+  }: {
+    parsed: ParsedDecklist;
+    originalText: string;
+    deckName: string;
+    source?: DeckSnapshot["source"];
+    inferredNameFromCommander?: boolean;
+  }) {
+    setWarnings(parsed.warnings);
+    setImportMessage("Fetching Scryfall card data...");
+    const result = await hydrateDeckEntries(parsed);
+    setUnresolvedNames(result.unresolvedNames);
+    const commanderEntry = findCommander(result.entries, parsed.commanderName);
+    const now = new Date().toISOString();
+    const nextDeck: DeckSnapshot = {
+      id: `deck_${Date.now()}`,
+      name: inferredNameFromCommander && commanderEntry ? `${commanderEntry.name} Deck` : deckName,
+      format: "commander",
+      originalText,
+      commanderId: commanderEntry?.id,
+      entries: result.entries,
+      importedAt: now,
+      updatedAt: now,
+      source,
+    };
+    if (!commanderEntry) {
+      const candidates = findCommanderCandidates(result.entries);
+      if (candidates.length > 0) {
+        setPendingImport({ deck: nextDeck, candidates });
+        setImportMessage("Choose the commander to finish import.");
+        return;
+      }
+    }
+    saveImportedDeck(nextDeck, commanderEntry?.id ?? result.entries[0]?.id);
+    setImportMessage(`Imported ${result.entries.length} unique card${result.entries.length === 1 ? "" : "s"}.`);
+  }
+
+  async function syncArchidektDeck() {
+    if (!deck?.source || deck.source.type !== "archidekt") return;
+    setIsSyncingArchidekt(true);
+    setAddCardStatus("Syncing from Archidekt...");
+    setWarnings([]);
+    setUnresolvedNames([]);
+    try {
+      const imported = await fetchArchidektDeck(deck.source.url);
+      setWarnings(imported.parsed.warnings);
+      const result = await hydrateDeckEntries(imported.parsed);
+      setUnresolvedNames(result.unresolvedNames);
+      const commanderEntry = findCommander(result.entries, imported.parsed.commanderName);
+      const candidates = commanderEntry ? [] : findCommanderCandidates(result.entries);
+      const chosenCommanderId = commanderEntry?.id ?? (deck.commanderId && result.entries.some((entry) => entry.id === deck.commanderId) ? deck.commanderId : candidates[0]?.id);
+      const now = new Date().toISOString();
+      const nextDeck: DeckSnapshot = {
+        ...deck,
+        name: imported.name || deck.name,
+        originalText: imported.originalText,
+        commanderId: chosenCommanderId,
+        entries: result.entries,
+        updatedAt: now,
+        source: makeArchidektSource(imported, now),
+      };
+      replaceDeckSnapshot(nextDeck, chosenCommanderId ?? result.entries[0]?.id);
+      setDeckText(imported.originalText);
+      setArchidektUrl(imported.url);
+      setAddCardStatus(`Synced ${result.entries.length} unique card${result.entries.length === 1 ? "" : "s"} from Archidekt.`);
+    } catch (error) {
+      setAddCardStatus(error instanceof Error ? error.message : "Archidekt sync failed.");
+    } finally {
+      setIsSyncingArchidekt(false);
     }
   }
 
@@ -246,6 +333,20 @@ export function App() {
       },
     }));
     setActiveView("deck");
+  }
+
+  function replaceDeckSnapshot(nextDeck: DeckSnapshot, nextSelectedCardId?: string) {
+    setDecks((current) => current.map((savedDeck) => (savedDeck.id === nextDeck.id ? nextDeck : savedDeck)));
+    setSelectedCardId(nextSelectedCardId);
+    setModalCardId(undefined);
+    setCardPreview(undefined);
+    setGraphStateByDeckId((current) => ({
+      ...current,
+      [nextDeck.id]: {
+        selectedNodeId: nextSelectedCardId ? `card:${nextSelectedCardId}` : undefined,
+        hiddenNodeIds: current[nextDeck.id]?.hiddenNodeIds?.filter((nodeId) => nextDeck.entries.some((entry) => nodeId === `card:${entry.id}`)) ?? [],
+      },
+    }));
   }
 
   function selectSavedDeck(deckId: string) {
@@ -281,9 +382,13 @@ export function App() {
     }
     setIsAnsweringQuestion(true);
     setQuestionError(undefined);
+    const startedAt = performance.now();
     try {
       const result = await provider.answerQuestion({ deck, availableQueries, question });
-      saveQuestionThreadMessage(deck.id, question, result);
+      saveQuestionThreadMessage(deck.id, question, {
+        ...result,
+        generationTimeMs: result.generationTimeMs ?? Math.max(0, Math.round(performance.now() - startedAt)),
+      });
       setQuestionText("");
     } catch (error) {
       setQuestionError(error instanceof Error ? error.message : "Question failed.");
@@ -370,11 +475,26 @@ export function App() {
       await analyzeCard(node.cardId);
       return;
     }
+    const connected = getConnectedGraphItems(deckGraph, node.id);
+    const connectedNodeText = connected.nodes
+      .slice(0, 18)
+      .map((item) => `${item.label} (${item.kind}${item.cardId ? `, cardId ${item.cardId}` : ""})`)
+      .join("; ");
+    const edgeText = connected.edges
+      .slice(0, 18)
+      .map((edge) => `${edge.kind}${edge.connectionGroup ? ` / ${edge.connectionGroup}` : ""}: ${edge.sourceId} -> ${edge.targetId}${edge.evidence ? `; evidence: ${edge.evidence}` : ""}`)
+      .join("\n");
     await runAnalysis(async () => {
       const result = await provider.answerQuestion({
         deck,
         availableQueries,
-        question: `Analyze the graph node "${node.label}" (${node.kind}) in this Commander deck. Explain the cards that support it, the strongest connections, weak points, and what to inspect next.`,
+        question: [
+          `Analyze the graph node "${node.label}" (${node.kind}) in this Commander deck.`,
+          `Node summary: ${node.summary}`,
+          connectedNodeText ? `Connected nodes/cards: ${connectedNodeText}` : "Connected nodes/cards: none visible.",
+          edgeText ? `Visible relationships:\n${edgeText}` : "Visible relationships: none visible.",
+          "Explain what this strategy/package/resource/risk represents, what cards make it work, the strongest connections, weak points, and what to inspect next.",
+        ].join("\n\n"),
       });
       return {
         ...result,
@@ -382,7 +502,7 @@ export function App() {
         kind: "graph-node-analysis",
         subjectGraphNodeId: node.id,
         title: `${node.label} Graph Analysis`,
-        summary: node.summary,
+        summary: result.summary ?? node.summary,
       };
     });
   }
@@ -390,9 +510,15 @@ export function App() {
   async function analyzeCardGraph(cardId: string, prompt?: string) {
     if (!deck || !deckGraph) return;
     const trimmedPrompt = prompt?.trim();
+    const startedAt = performance.now();
     setGraphAnalyzingCardId(cardId);
     try {
-      const patch = await provider.analyzeCardGraph({ deck, graph: deckGraph, cardId, availableQueries, prompt: trimmedPrompt });
+      const patch = withGraphPatchRunFallbacks(
+        await provider.analyzeCardGraph({ deck, graph: deckGraph, cardId, availableQueries, prompt: trimmedPrompt }),
+        Math.max(0, Math.round(performance.now() - startedAt)),
+        makeClientGraphPatchPromptText("Analyze card graph", deck.name, cardId, trimmedPrompt),
+        makeClientGraphPatchReasoning("card"),
+      );
       setGraphPatchesByDeckId((current) => ({
         ...current,
         [deck.id]: {
@@ -435,18 +561,81 @@ export function App() {
     }
   }
 
-  async function analyzeDeckGraph() {
-    if (!deck || !deckGraph) return;
-    setIsAnalyzingDeckGraph(true);
-    setDeckGraphPatchError(undefined);
-    setDeckGraphPatchStatus("Generating deck patch...");
+  async function analyzeCardGraphLite(cardId: string, prompt?: string) {
+    if (!deck) return;
+    const card = deck.entries.find((entry) => entry.id === cardId);
+    if (!card) return;
+    const trimmedPrompt = prompt?.trim();
+    const startedAt = performance.now();
+    setGraphAnalyzingCardId(cardId);
     try {
-      const patch = await provider.analyzeDeckGraph({ deck, graph: deckGraph, availableQueries });
+      const patch = withGraphPatchRunFallbacks(
+        await provider.analyzeCardGraphLite({ deckId: deck.id, card, prompt: trimmedPrompt }),
+        Math.max(0, Math.round(performance.now() - startedAt)),
+        makeClientGraphPatchPromptText("Analyze card graph lite", deck.name, cardId, trimmedPrompt),
+        makeClientGraphPatchReasoning("card-lite"),
+      );
       setGraphPatchesByDeckId((current) => ({
         ...current,
         [deck.id]: {
           ...(current[deck.id] ?? {}),
-          [DECK_ANALYSIS_PATCH_KEY]: patch,
+          [cardId]: mergeDeckGraphPatches(current[deck.id]?.[cardId], patch),
+        },
+      }));
+      setGraphPatchErrorsByCardId((current) => {
+        const next = { ...current };
+        delete next[cardId];
+        return next;
+      });
+      setGraphStateByDeckId((current) => ({
+        ...current,
+        [deck.id]: {
+          ...current[deck.id],
+          selectedNodeId: `card:${cardId}`,
+        },
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Card graph lite analysis failed.";
+      setGraphPatchErrorsByCardId((current) => ({ ...current, [cardId]: message }));
+      setAnalysesByDeckId((current) => ({
+        ...current,
+        [deck.id]: [
+          {
+            id: `graph_patch_error_${Date.now()}`,
+            kind: "freeform",
+            title: "Card Graph Lite Analysis Failed",
+            summary: message,
+            layout: { type: "NarrativePanel", title: "Graph Patch Error", body: message },
+            createdAt: new Date().toISOString(),
+            source: providerConfig.mode === "local" ? "custom" : "mock",
+          },
+          ...(current[deck.id] ?? []),
+        ],
+      }));
+    } finally {
+      setGraphAnalyzingCardId(undefined);
+    }
+  }
+
+  async function analyzeDeckGraph(prompt?: string) {
+    if (!deck || !deckGraph) return;
+    const trimmedPrompt = prompt?.trim();
+    const startedAt = performance.now();
+    setIsAnalyzingDeckGraph(true);
+    setDeckGraphPatchError(undefined);
+    setDeckGraphPatchStatus("Generating deck patch...");
+    try {
+      const patch = withGraphPatchRunFallbacks(
+        await provider.analyzeDeckGraph({ deck, graph: deckGraph, availableQueries, prompt: trimmedPrompt }),
+        Math.max(0, Math.round(performance.now() - startedAt)),
+        makeClientGraphPatchPromptText("Analyze deck graph", deck.name, undefined, trimmedPrompt),
+        makeClientGraphPatchReasoning("deck"),
+      );
+      setGraphPatchesByDeckId((current) => ({
+        ...current,
+        [deck.id]: {
+          ...(current[deck.id] ?? {}),
+          [DECK_ANALYSIS_PATCH_KEY]: trimmedPrompt ? mergeDeckGraphPatches(current[deck.id]?.[DECK_ANALYSIS_PATCH_KEY], patch) : patch,
         },
       }));
       setDeckGraphPatchStatus(
@@ -532,11 +721,60 @@ export function App() {
     if (!confirmed) return;
     setGraphPatchesByDeckId((current) => {
       const deletionPatch = current[deck.id]?.[EDGE_DELETIONS_PATCH_KEY];
+      const nodeDeletionPatch = current[deck.id]?.[NODE_DELETIONS_PATCH_KEY];
       const nextDeckPatches: Record<string, DeckGraphPatch> = {};
       if (deletionPatch) nextDeckPatches[EDGE_DELETIONS_PATCH_KEY] = deletionPatch;
+      if (nodeDeletionPatch) nextDeckPatches[NODE_DELETIONS_PATCH_KEY] = nodeDeletionPatch;
       return {
         ...current,
         [deck.id]: nextDeckPatches,
+      };
+    });
+  }
+
+  function deleteGraphNode(nodeId: string) {
+    if (!deck || !deckGraph) return;
+    const node = deckGraph.nodes.find((item) => item.id === nodeId);
+    if (!node || node.kind === "card") return;
+    const connectedEdgeIds = deckGraph.edges.filter((edge) => edge.sourceId === nodeId || edge.targetId === nodeId).map((edge) => edge.id);
+    const confirmed = window.confirm(
+      `Delete "${node.label}" and ${connectedEdgeIds.length} connected relationship${connectedEdgeIds.length === 1 ? "" : "s"} from the graph?`,
+    );
+    if (!confirmed) return;
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = current[deck.id] ?? {};
+      const currentPatch = deckPatches[NODE_DELETIONS_PATCH_KEY];
+      const removedNodeIds = Array.from(new Set([...(currentPatch?.nodeIdsToRemove ?? []), nodeId]));
+      const removedEdgeIds = Array.from(new Set([...(currentPatch?.edgeIdsToRemove ?? []), ...connectedEdgeIds]));
+      const deletionPatch: DeckGraphPatch = {
+        id: currentPatch?.id ?? `patch_${deck.id}_node_deletions`,
+        deckId: deck.id,
+        cardId: NODE_DELETIONS_PATCH_KEY,
+        nodesToUpsert: [],
+        edgesToUpsert: [],
+        edgeFunctions: [],
+        nodeIdsToRemove: removedNodeIds,
+        edgeIdsToRemove: removedEdgeIds,
+        notes: [`${removedNodeIds.length} graph node${removedNodeIds.length === 1 ? "" : "s"} manually deleted.`],
+        generatedAt: new Date().toISOString(),
+        source: "ai",
+      };
+      return {
+        ...current,
+        [deck.id]: {
+          ...deckPatches,
+          [NODE_DELETIONS_PATCH_KEY]: deletionPatch,
+        },
+      };
+    });
+    setGraphStateByDeckId((current) => {
+      const currentState = current[deck.id] ?? {};
+      return {
+        ...current,
+        [deck.id]: {
+          ...currentState,
+          selectedNodeId: deckGraph.nodes.find((item) => item.id !== nodeId)?.id,
+        },
       };
     });
   }
@@ -825,17 +1063,20 @@ export function App() {
   );
 
   async function runAnalysis(action: () => Promise<AnalysisResult>) {
+    const startedAt = performance.now();
     setIsAnalyzing(true);
     try {
       const result = await action();
       if (!deck) return;
+      const generationTimeMs = result.generationTimeMs ?? Math.max(0, Math.round(performance.now() - startedAt));
       setAnalysesByDeckId((current) => ({
         ...current,
-        [deck.id]: [result, ...(current[deck.id] ?? [])],
+        [deck.id]: [{ ...result, generationTimeMs }, ...(current[deck.id] ?? [])],
       }));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Analysis failed.";
       if (!deck) return;
+      const generationTimeMs = Math.max(0, Math.round(performance.now() - startedAt));
       setAnalysesByDeckId((current) => ({
         ...current,
         [deck.id]: [
@@ -844,6 +1085,8 @@ export function App() {
           kind: "freeform",
           title: "Analysis Failed",
           summary: message,
+          generationTimeMs,
+          reasoningSummary: "The provider request failed before an analysis could be generated. The app captured the error and rendered it as an analysis result so it can be reviewed.",
           layout: { type: "NarrativePanel", title: "Provider Error", body: message },
           createdAt: new Date().toISOString(),
           source: providerConfig.mode === "local" ? "custom" : "mock",
@@ -918,12 +1161,16 @@ export function App() {
         <>
           <ImportPanel
             deckText={deckText}
+            archidektUrl={archidektUrl}
             isImporting={isImporting}
+            isImportingArchidekt={isImportingArchidekt}
             importMessage={importMessage}
             warnings={warnings}
             unresolvedNames={unresolvedNames}
             onDeckTextChange={setDeckText}
+            onArchidektUrlChange={setArchidektUrl}
             onImport={importDeck}
+            onImportArchidekt={importArchidektDeck}
           />
 
           {pendingImport && (
@@ -951,6 +1198,18 @@ export function App() {
                 </select>
               </label>
               {deck?.commanderId && <span className="library-meta">Commander saved: {commander?.name}</span>}
+              {deck?.source?.type === "archidekt" && (
+                <div className="archidekt-sync-controls">
+                  <a href={deck.source.url} target="_blank" rel="noreferrer">
+                    Archidekt
+                  </a>
+                  {deck.source.lastSyncedAt && <span>Synced {formatDateTime(deck.source.lastSyncedAt)}</span>}
+                  <button type="button" className="secondary-button" onClick={() => void syncArchidektDeck()} disabled={isSyncingArchidekt}>
+                    <RefreshCw size={16} />
+                    {isSyncingArchidekt ? "Syncing..." : "Sync"}
+                  </button>
+                </div>
+              )}
             </section>
           )}
 
@@ -1158,14 +1417,25 @@ export function App() {
             onAnalyzeNode={(nodeId) => void analyzeGraphNode(nodeId)}
             onPromptAnalyzeNode={(nodeId, prompt) => void analyzeGraphNodePrompt(nodeId, prompt)}
             onHideNode={hideGraphNode}
+            onDeleteNode={deleteGraphNode}
             onDeleteEdge={deleteGraphEdge}
             onDeleteEdges={deleteGraphEdges}
             onResetHiddenNodes={resetHiddenGraphNodes}
           toolbarActions={
               <>
-                <button type="button" className="primary-button" onClick={() => void analyzeDeckGraph()} disabled={isAnalyzingDeckGraph}>
+                <label className="deck-graph-prompt-panel" htmlFor="deck-graph-prompt">
+                  <span>Deck Prompt Optional</span>
+                  <textarea
+                    id="deck-graph-prompt"
+                    value={deckGraphPrompt}
+                    onChange={(event) => setDeckGraphPrompt(event.target.value)}
+                    placeholder="Example: Make a Power 7 Strategy and connect all cards that have power 7 bonuses to them."
+                    rows={3}
+                  />
+                </label>
+                <button type="button" className="primary-button" onClick={() => void analyzeDeckGraph(deckGraphPrompt)} disabled={isAnalyzingDeckGraph}>
                   <Sparkles size={16} />
-                  {isAnalyzingDeckGraph ? "Generating..." : deckAnalysisGraphPatch ? "Refresh Deck Patch" : "Generate Deck Patch"}
+                  {isAnalyzingDeckGraph ? "Generating..." : deckGraphPrompt.trim() ? "Add Deck Connections" : deckAnalysisGraphPatch ? "Refresh Deck Patch" : "Generate Deck Patch"}
                 </button>
                 {deckAnalysisGraphPatch && (
                   <button type="button" className="secondary-button" onClick={clearDeckGraphPatch}>
@@ -1203,6 +1473,7 @@ export function App() {
           graphError={graphPatchErrorsByCardId[modalCard.id]}
           onAnalyzeCard={() => void analyzeCard(modalCard.id)}
           onAnalyzeCardGraph={(prompt) => void analyzeCardGraph(modalCard.id, prompt)}
+          onAnalyzeCardGraphLite={(prompt) => void analyzeCardGraphLite(modalCard.id, prompt)}
           onClearCardGraphPatch={() => clearCardGraphPatch(modalCard.id)}
           onDeleteGraphEdge={deleteGraphEdge}
           onDeleteGraphEdges={deleteGraphEdges}
@@ -1229,6 +1500,7 @@ function CardDetailModal({
   isAnalyzingGraph,
   onAnalyzeCard,
   onAnalyzeCardGraph,
+  onAnalyzeCardGraphLite,
   onClearCardGraphPatch,
   onDeleteGraphEdge,
   onDeleteGraphEdges,
@@ -1247,6 +1519,7 @@ function CardDetailModal({
   isAnalyzingGraph: boolean;
   onAnalyzeCard: () => void;
   onAnalyzeCardGraph: (prompt?: string) => void;
+  onAnalyzeCardGraphLite: (prompt?: string) => void;
   onClearCardGraphPatch: () => void;
   onDeleteGraphEdge: (edgeId: string) => void;
   onDeleteGraphEdges: (edgeIds: string[], label?: string) => void;
@@ -1259,11 +1532,13 @@ function CardDetailModal({
   const [selectedModalGraphNodeId, setSelectedModalGraphNodeId] = useState(`card:${card.id}`);
   const [patchCopyStatus, setPatchCopyStatus] = useState<string>();
   const [graphPrompt, setGraphPrompt] = useState("");
+  const [activeGraphRunTab, setActiveGraphRunTab] = useState<"prompt" | "reasoning">("reasoning");
 
   useEffect(() => {
     setSelectedModalGraphNodeId(`card:${card.id}`);
     setPatchCopyStatus(undefined);
     setGraphPrompt("");
+    setActiveGraphRunTab("reasoning");
   }, [card.id]);
 
   useEffect(() => {
@@ -1325,9 +1600,20 @@ function CardDetailModal({
                     className="primary-button"
                     onClick={() => onAnalyzeCardGraph(graphPrompt)}
                     disabled={isAnalyzingGraph}
+                    title="Analyze this card using the full deck and current graph as context."
                   >
                     <Brain size={16} />
-                    {isAnalyzingGraph ? "Analyzing..." : "Analyze Card Graph"}
+                    {isAnalyzingGraph ? "Analyzing..." : "Analyze Connections"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => onAnalyzeCardGraphLite(graphPrompt)}
+                    disabled={isAnalyzingGraph}
+                    title="Quickly analyze only this card and generate card-only connection functions."
+                  >
+                    <Sparkles size={16} />
+                    Quick Connections
                   </button>
                 </div>
                 <p className="modal-graph-prompt-status">
@@ -1337,6 +1623,13 @@ function CardDetailModal({
                       ? `Last graph analysis saved ${graphPatch.edgesToUpsert.length} direct edge${graphPatch.edgesToUpsert.length === 1 ? "" : "s"} and ${graphPatch.edgeFunctions?.length ?? 0} edge function${(graphPatch.edgeFunctions?.length ?? 0) === 1 ? "" : "s"}.${formatGraphPatchUsage(graphPatch)}`
                       : "Generate AI graph edges with an optional prompt, then build up the deck graph card by card.")}
                 </p>
+                {graphPatch && (
+                  <GraphPatchRunDetails
+                    graphPatch={graphPatch}
+                    activeTab={activeGraphRunTab}
+                    onActiveTabChange={setActiveGraphRunTab}
+                  />
+                )}
               </div>
             )}
           </div>
@@ -1426,6 +1719,47 @@ function CommanderConfirmPanel({
   );
 }
 
+function GraphPatchRunDetails({
+  graphPatch,
+  activeTab,
+  onActiveTabChange,
+}: {
+  graphPatch: DeckGraphPatch;
+  activeTab: "prompt" | "reasoning";
+  onActiveTabChange: (tab: "prompt" | "reasoning") => void;
+}) {
+  const hasPrompt = Boolean(graphPatch.promptText?.trim());
+  const hasReasoning = Boolean(graphPatch.reasoningSummary?.trim());
+  if (!hasPrompt && !hasReasoning && graphPatch.generationTimeMs === undefined) return null;
+  const activeContent =
+    activeTab === "prompt"
+      ? graphPatch.promptText?.trim() || "No prompt text was captured for this graph analysis."
+      : graphPatch.reasoningSummary?.trim() || "No reasoning summary was captured for this graph analysis.";
+
+  return (
+    <div className="graph-run-details">
+      {graphPatch.generationTimeMs !== undefined && (
+        <div className="graph-run-meta">
+          Generated in <strong>{formatDuration(graphPatch.generationTimeMs)}</strong>
+        </div>
+      )}
+      {(hasPrompt || hasReasoning) && (
+        <>
+          <div className="tab-row graph-run-tabs" role="tablist" aria-label="Card graph analysis run details">
+            <button type="button" className={activeTab === "prompt" ? "active" : ""} onClick={() => onActiveTabChange("prompt")}>
+              Prompt
+            </button>
+            <button type="button" className={activeTab === "reasoning" ? "active" : ""} onClick={() => onActiveTabChange("reasoning")}>
+              Reasoning
+            </button>
+          </div>
+          <pre className="graph-run-text">{activeContent}</pre>
+        </>
+      )}
+    </div>
+  );
+}
+
 function CardHoverPreview({ card, left, top }: { card: DeckEntry; left: number; top: number }) {
   const imageUri = getImageUri(card);
   return (
@@ -1481,10 +1815,82 @@ function mergeDeckGraphPatches(existing: DeckGraphPatch | undefined, incoming: D
     nodesToUpsert: mergeById(existing.nodesToUpsert, incoming.nodesToUpsert),
     edgesToUpsert: mergeById(existing.edgesToUpsert.map(normalizeDeckGraphEdgeId), incoming.edgesToUpsert.map(normalizeDeckGraphEdgeId)),
     edgeFunctions: mergeById(existing.edgeFunctions ?? [], incoming.edgeFunctions ?? []),
+    nodeIdsToRemove: Array.from(new Set([...(existing.nodeIdsToRemove ?? []), ...(incoming.nodeIdsToRemove ?? [])])),
     edgeIdsToRemove: Array.from(new Set([...(existing.edgeIdsToRemove ?? []), ...(incoming.edgeIdsToRemove ?? [])])),
     notes: [...existing.notes, ...incoming.notes],
+    generationTimeMs: incoming.generationTimeMs ?? existing.generationTimeMs,
+    promptText: incoming.promptText ?? existing.promptText,
+    reasoningSummary: incoming.reasoningSummary ?? existing.reasoningSummary,
     generatedAt: new Date().toISOString(),
   };
+}
+
+function withGraphPatchRunFallbacks(
+  patch: DeckGraphPatch,
+  generationTimeMs: number,
+  promptText: string,
+  reasoningSummary: string,
+): DeckGraphPatch {
+  return {
+    ...patch,
+    generationTimeMs: patch.generationTimeMs ?? generationTimeMs,
+    promptText: patch.promptText?.trim() ? patch.promptText : promptText,
+    reasoningSummary: patch.reasoningSummary?.trim() ? patch.reasoningSummary : summarizeGraphPatchExecution(patch, reasoningSummary),
+  };
+}
+
+function summarizeGraphPatchExecution(patch: DeckGraphPatch, fallback: string): string {
+  const lines: string[] = [];
+  if (patch.cardId) lines.push(`- looked at selected card ${patch.cardId} as the graph focus`);
+  const conceptNodes = patch.nodesToUpsert.filter((node) => node.kind !== "card");
+  conceptNodes.slice(0, 3).forEach((node) => {
+    lines.push(`- made ${node.kind} node "${node.label}"`);
+  });
+  patch.edgesToUpsert.slice(0, 4).forEach((edge) => {
+    const group = edge.connectionGroup ? ` (${edge.connectionGroup})` : "";
+    lines.push(`- added ${edge.kind}${group} edge ${edge.sourceId} -> ${edge.targetId}`);
+  });
+  patch.edgeFunctions?.slice(0, 4).forEach((edgeFunction) => {
+    const target = edgeFunction.targetId ? ` to ${edgeFunction.targetId}` : edgeFunction.sourceId ? ` from ${edgeFunction.sourceId}` : "";
+    const group = edgeFunction.connectionGroup ? ` for ${edgeFunction.connectionGroup}` : "";
+    lines.push(`- made edgeFunction ${edgeFunction.id}${target}${group}`);
+  });
+  patch.notes.slice(0, 3).forEach((note) => {
+    if (!lines.some((line) => line.includes(note))) lines.push(`- noted ${note}`);
+  });
+  return lines.length ? lines.slice(0, 8).join("\n") : fallback;
+}
+
+function makeClientGraphPatchPromptText(task: string, deckName: string, cardId?: string, prompt?: string): string {
+  return [
+    `Task: ${task}`,
+    `Deck: ${deckName}`,
+    cardId ? `Selected card id: ${cardId}` : undefined,
+    prompt ? `Custom prompt: ${prompt}` : "Custom prompt: (none)",
+    "Use the current deck snapshot and graph to produce a DeckGraphPatch.",
+  ].filter(Boolean).join("\n");
+}
+
+function makeClientGraphPatchReasoning(kind: "card" | "card-lite" | "deck"): string {
+  if (kind === "card") {
+    return [
+      "1. Read the selected card as the graph focus.",
+      "2. Compared it against current graph context and deck card relationships.",
+      "3. Returned graph patch nodes, edges, and edge functions for the strongest matches.",
+    ].join("\n");
+  }
+  if (kind === "card-lite") {
+    return [
+      "- looked at the selected card by itself",
+      "- skipped deck pool and graph context",
+      "- returned only reusable edgeFunctions inferred from that card",
+    ].join("\n");
+  }
+  return [
+    "1. Read the deck and graph as a whole.",
+    "2. Looked for broad graph-worthy packages and reusable selectors.",
+    "3. Returned a deck-level graph patch for the strongest groupings.",
+  ].join("\n");
 }
 
 function formatGraphPatchUsage(graphPatch: DeckGraphPatch): string {
@@ -1492,6 +1898,15 @@ function formatGraphPatchUsage(graphPatch: DeckGraphPatch): string {
   if (!usage) return "";
   if (usage.reportedTotalTokens) return ` Tokens used: ${formatCount(usage.reportedTotalTokens)}.`;
   return ` Estimated tokens used: ${formatCount(usage.totalTokensEstimate)} (${formatCount(usage.promptTokensEstimate + usage.contextFileTokensEstimate)} in, ${formatCount(usage.outputTokensEstimate)} out).`;
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  const seconds = milliseconds / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} sec`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.round(seconds % 60);
+  return `${minutes}m ${remainingSeconds}s`;
 }
 
 function formatDeleteEdgeConfirmation(graph: DeckGraph, edge: DeckGraph["edges"][number]): string {
@@ -1514,6 +1929,22 @@ function formatQuestionThreadDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function makeArchidektSource(imported: ArchidektImport, lastSyncedAt = new Date().toISOString()): DeckSnapshot["source"] {
+  return {
+    type: "archidekt",
+    url: imported.url,
+    deckId: imported.deckId,
+    name: imported.name,
+    lastSyncedAt,
+  };
 }
 
 function mergeById<T extends { id: string }>(existing: T[], incoming: T[]): T[] {

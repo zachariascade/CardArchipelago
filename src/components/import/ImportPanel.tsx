@@ -1,4 +1,4 @@
-import { UploadCloud } from "lucide-react";
+import { Link, UploadCloud } from "lucide-react";
 
 export const DEFAULT_DECKLIST = `MAINBOARD:
 1 Anger
@@ -125,20 +125,28 @@ SIDEBOARD:
 
 export function ImportPanel({
   deckText,
+  archidektUrl,
   isImporting,
+  isImportingArchidekt,
   importMessage,
   warnings,
   unresolvedNames,
   onDeckTextChange,
+  onArchidektUrlChange,
   onImport,
+  onImportArchidekt,
 }: {
   deckText: string;
+  archidektUrl: string;
   isImporting: boolean;
+  isImportingArchidekt: boolean;
   importMessage?: string;
   warnings: string[];
   unresolvedNames: string[];
   onDeckTextChange: (value: string) => void;
+  onArchidektUrlChange: (value: string) => void;
   onImport: () => void;
+  onImportArchidekt: () => void;
 }) {
   return (
     <section className="import-panel">
@@ -149,6 +157,20 @@ export function ImportPanel({
         </div>
         <button type="button" className="secondary-button" onClick={() => onDeckTextChange(DEFAULT_DECKLIST)}>
           Reset Default
+        </button>
+      </div>
+      <div className="archidekt-import">
+        <label>
+          <span>Archidekt link</span>
+          <input
+            value={archidektUrl}
+            onChange={(event) => onArchidektUrlChange(event.target.value)}
+            placeholder="https://archidekt.com/decks/123456/deck-name"
+          />
+        </label>
+        <button type="button" className="secondary-button" onClick={onImportArchidekt} disabled={isImporting || isImportingArchidekt || !archidektUrl.trim()}>
+          <Link size={16} />
+          {isImportingArchidekt ? "Importing..." : "Import from Archidekt"}
         </button>
       </div>
       <textarea value={deckText} onChange={(event) => onDeckTextChange(event.target.value)} spellCheck={false} />

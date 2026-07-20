@@ -74,6 +74,8 @@ p {
 .provider-control,
 .toolbar,
 .import-actions,
+.archidekt-import,
+.archidekt-sync-controls,
 .panel-actions {
   display: flex;
   align-items: center;
@@ -83,6 +85,7 @@ p {
 
 .provider-control input,
 .provider-control select,
+.archidekt-import input,
 .toolbar select,
 .search-box,
 textarea {
@@ -94,6 +97,7 @@ textarea {
 
 .provider-control input,
 .provider-control select,
+.archidekt-import input,
 .deck-library-bar select,
 .toolbar select {
   height: 36px;
@@ -119,6 +123,31 @@ textarea {
 .import-panel {
   padding: 16px;
   margin-bottom: 14px;
+}
+
+.archidekt-import {
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid #e0d7ca;
+  border-radius: 7px;
+  background: #fffdf8;
+}
+
+.archidekt-import label {
+  display: grid;
+  gap: 4px;
+  flex: 1 1 320px;
+  min-width: min(320px, 100%);
+}
+
+.archidekt-import label span {
+  color: #4d585c;
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.archidekt-import input {
+  width: 100%;
 }
 
 .commander-confirm {
@@ -329,6 +358,12 @@ textarea {
   background: #f4eee4;
   color: #2d3437;
   border-color: #d8cec0;
+}
+
+.danger-button {
+  color: #8f2c24;
+  border-color: #e3b7b1;
+  background: #fff1ee;
 }
 
 .compact-button {
@@ -924,6 +959,114 @@ textarea {
   font-style: normal;
 }
 
+.graph-concept-node-view {
+  display: grid;
+  gap: 12px;
+}
+
+.graph-concept-node-summary,
+.graph-concept-analysis-panel {
+  border: 1px solid #d8cec0;
+  border-radius: 7px;
+  background: #fffdf8;
+  padding: 10px;
+}
+
+.graph-concept-node-summary > span,
+.graph-concept-analysis-heading > span {
+  display: block;
+  margin-bottom: 5px;
+  color: #657073;
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.graph-concept-node-summary p,
+.graph-concept-empty {
+  margin: 0;
+  color: #4f585c;
+  line-height: 1.45;
+}
+
+.graph-concept-card-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.graph-concept-card-list button {
+  border: 1px solid #d8cec0;
+  border-radius: 999px;
+  background: #fffaf1;
+  color: #202426;
+  padding: 5px 8px;
+  font-size: 0.78rem;
+  font-weight: 750;
+}
+
+.graph-concept-edge-list {
+  display: grid;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.graph-concept-edge-list li {
+  display: grid;
+  gap: 2px;
+  border-top: 1px solid #eadfce;
+  padding-top: 8px;
+}
+
+.graph-concept-edge-list strong {
+  color: #202426;
+  font-size: 0.84rem;
+}
+
+.graph-concept-edge-list span {
+  color: #687075;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.graph-concept-analysis-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.graph-concept-analysis-heading > span {
+  margin-bottom: 0;
+}
+
+.graph-concept-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.graph-concept-analysis-panel .analysis-result {
+  gap: 10px;
+}
+
+.graph-concept-analysis-panel .analysis-title h2 {
+  font-size: 1rem;
+}
+
+.graph-concept-analysis-panel .analysis-title p,
+.graph-concept-analysis-panel .narrative-panel,
+.graph-concept-analysis-panel .evidence-list {
+  font-size: 0.86rem;
+}
+
 .graph-prompt-panel {
   display: grid;
   gap: 8px;
@@ -957,6 +1100,27 @@ textarea {
   justify-self: start;
 }
 
+.deck-graph-prompt-panel {
+  flex: 1 1 360px;
+  min-width: min(420px, 100%);
+  display: grid;
+  gap: 5px;
+}
+
+.deck-graph-prompt-panel span {
+  color: #657073;
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.deck-graph-prompt-panel textarea {
+  min-height: 68px;
+  margin: 0;
+  background: #fffdf8;
+}
+
 .modal-graph-prompt {
   margin-bottom: 12px;
 }
@@ -973,6 +1137,42 @@ textarea {
   color: #687075;
   font-size: 0.88rem;
   line-height: 1.4;
+}
+
+.graph-run-details {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #e7ded2;
+  padding-top: 8px;
+}
+
+.graph-run-meta {
+  color: #687075;
+  font-size: 0.84rem;
+}
+
+.graph-run-meta strong {
+  color: #202426;
+}
+
+.graph-run-tabs {
+  margin-top: 0;
+}
+
+.graph-run-text {
+  max-height: 180px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #eadfce;
+  border-radius: 6px;
+  background: #fffaf1;
+  color: #2d3437;
+  padding: 9px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.78rem;
+  line-height: 1.42;
 }
 
 .graph-connections-panel {
@@ -1435,6 +1635,25 @@ textarea {
   border-radius: 6px;
 }
 
+.archidekt-sync-controls {
+  margin-left: auto;
+}
+
+.archidekt-sync-controls a {
+  color: #285d66;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.archidekt-sync-controls a:hover {
+  text-decoration: underline;
+}
+
+.archidekt-sync-controls span {
+  color: #687075;
+  font-size: 0.84rem;
+}
+
 .stat span {
   display: block;
   color: #657073;
@@ -1666,6 +1885,7 @@ textarea {
 .deck-card {
   --stack-card-radius: clamp(8px, 5%, 13px);
   --stack-card-bottom-radius: 0;
+  --deck-card-menu-column: 38px;
   position: relative;
   z-index: 1;
   width: 100%;
@@ -1685,6 +1905,10 @@ textarea {
     filter 180ms ease;
 }
 
+.deck-card.has-menu {
+  overflow: visible;
+}
+
 .deck-card-open {
   position: relative;
   width: 100%;
@@ -1696,6 +1920,11 @@ textarea {
   background: transparent;
   color: inherit;
   text-align: left;
+}
+
+.deck-card.has-menu .deck-card-open {
+  max-height: inherit;
+  overflow: hidden;
 }
 
 .deck-card:last-child {
@@ -1769,7 +1998,10 @@ textarea {
   position: absolute;
   z-index: 50;
   top: 7px;
-  left: 8px;
+  left: calc(100% + 8px);
+  display: flex;
+  justify-content: center;
+  padding-top: 0;
 }
 
 .deck-card-menu-trigger {
@@ -1783,12 +2015,26 @@ textarea {
   color: #fffaf1;
   padding: 0;
   box-shadow: 0 3px 9px rgba(0, 0, 0, 0.22);
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+  transform: translateX(-2px);
+}
+
+.deck-card:hover .deck-card-menu-trigger,
+.deck-card:focus-within .deck-card-menu-trigger,
+.deck-card.menu-open .deck-card-menu-trigger {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(0);
 }
 
 .deck-card-menu-popover {
   position: absolute;
   top: calc(100% + 5px);
-  left: 0;
+  right: 0;
   display: grid;
   min-width: 168px;
   border: 1px solid #d8cec0;
@@ -2142,6 +2388,45 @@ textarea {
 
 .analysis-title {
   margin-bottom: 14px;
+}
+
+.analysis-run-details {
+  display: grid;
+  gap: 8px;
+  margin: -4px 0 14px;
+  border: 1px solid #e0d7ca;
+  border-radius: 8px;
+  background: #fffdf8;
+  padding: 10px;
+}
+
+.analysis-run-meta {
+  color: #687075;
+  font-size: 0.84rem;
+}
+
+.analysis-run-meta strong {
+  color: #202426;
+}
+
+.analysis-run-tabs {
+  margin-top: 0;
+}
+
+.analysis-run-text {
+  max-height: 260px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid #eadfce;
+  border-radius: 6px;
+  background: #fffaf1;
+  color: #2d3437;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .analysis-stack {

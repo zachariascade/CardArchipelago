@@ -92,8 +92,12 @@ export type DeckGraphPatch = {
   nodesToUpsert: DeckGraphNode[];
   edgesToUpsert: DeckGraphEdge[];
   edgeFunctions?: GraphEdgeFunction[];
+  nodeIdsToRemove?: string[];
   edgeIdsToRemove?: string[];
   usage?: DeckGraphPatchUsage;
+  generationTimeMs?: number;
+  promptText?: string;
+  reasoningSummary?: string;
   notes: string[];
   generatedAt: string;
   source: "ai";
@@ -444,32 +448,19 @@ export function buildDeckGraph(deck: DeckSnapshot): DeckGraph {
     cardIds: [entry.id],
     weight: entry.id === deck.commanderId ? 8 : Math.max(2, Math.min(5, entry.quantity + 1)),
   }));
-  const matches = [...PACKAGE_RULES, ...STRATEGY_RULES, ...RESOURCE_RULES, ...RISK_RULES]
-    .map((rule) => matchRule(rule, deck))
-    .filter((match) => match.count > 0);
-
-  matches.forEach((match) => {
-    nodes.push({
-      id: conceptNodeId(match.kind, match.id),
-      kind: match.kind,
-      label: match.label,
-      summary: match.summary,
-      cardIds: match.cardIds,
-      weight: Math.min(10, Math.max(4, match.count)),
-    });
-  });
 
   return {
     deckId: deck.id,
     variant: "ai-enriched",
     generatedAt: new Date().toISOString(),
-    procedureSummary: "Graph nodes are generated from deck structure and card text. Relationships are added only by AI card graph analysis.",
+    procedureSummary: "Base graph nodes are generated from deck cards only. Strategy, package, resource, and risk nodes are added by saved graph patches.",
     nodes,
     edges: [],
   };
 }
 
 export function generateDeckGraphPatch(deck: DeckSnapshot, graph: DeckGraph, prompt?: string): DeckGraphPatch {
+  const startedAt = performance.now();
   const nodesToUpsert: DeckGraphNode[] = [];
   const edgeFunctions: GraphEdgeFunction[] = [];
   const notes: string[] = [];
@@ -539,6 +530,17 @@ export function generateDeckGraphPatch(deck: DeckSnapshot, graph: DeckGraph, pro
     edgesToUpsert: [],
     edgeFunctions: edgeFunctions.filter((edgeFunction) => !graph.edges.some((edge) => edge.generatedByFunctionId === edgeFunction.id)),
     edgeIdsToRemove: [],
+    generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    promptText: makeGraphPatchPromptSummary("Analyze deck graph", deck.name, prompt),
+    reasoningSummary: makeGraphPatchExecutionSummary({
+      cardName: deck.name,
+      nodesToUpsert,
+      edgesToUpsert: [],
+      edgeFunctions,
+      notes,
+      customPrompt,
+      mode: "deck",
+    }),
     notes: notes.length ? notes : ["Deck-level pass did not find additional broad connection groups from the current heuristics."],
     generatedAt: new Date().toISOString(),
     source: "ai",
@@ -547,19 +549,24 @@ export function generateDeckGraphPatch(deck: DeckSnapshot, graph: DeckGraph, pro
 
 export function applyGraphPatches(graph: DeckGraph, patches: DeckGraphPatch[], deck?: DeckSnapshot): DeckGraph {
   if (!patches.length) return graph;
-  const nodes = [...graph.nodes];
+  const removedNodeIds = new Set(patches.flatMap((patch) => patch.nodeIdsToRemove ?? []));
+  const nodes = graph.nodes.filter((node) => !removedNodeIds.has(node.id));
   const removedEdgeIds = new Set(patches.flatMap((patch) => patch.edgeIdsToRemove ?? []));
-  const edges = graph.edges.filter((edge) => !removedEdgeIds.has(edge.id));
+  const edges = graph.edges.filter((edge) => !removedEdgeIds.has(edge.id) && !removedNodeIds.has(edge.sourceId) && !removedNodeIds.has(edge.targetId));
 
   patches.forEach((patch) => {
-    patch.nodesToUpsert.forEach((node) => upsertNode(nodes, node));
+    patch.nodesToUpsert.forEach((node) => {
+      if (!removedNodeIds.has(node.id)) upsertNode(nodes, node);
+    });
     patch.edgesToUpsert.forEach((edge) => {
       const normalizedEdge = withPatchOwnership(normalizeDeckGraphEdgeId(edge), patch);
+      if (removedNodeIds.has(normalizedEdge.sourceId) || removedNodeIds.has(normalizedEdge.targetId)) return;
       if (removedEdgeIds.has(edge.id) || removedEdgeIds.has(normalizedEdge.id)) return;
       edges.push(normalizedEdge);
     });
     expandGraphEdgeFunctions(deck, patch).forEach((edge) => {
       const normalizedEdge = withPatchOwnership(normalizeDeckGraphEdgeId(edge), patch);
+      if (removedNodeIds.has(normalizedEdge.sourceId) || removedNodeIds.has(normalizedEdge.targetId)) return;
       if (removedEdgeIds.has(edge.id) || removedEdgeIds.has(normalizedEdge.id)) return;
       edges.push(normalizedEdge);
     });
@@ -655,6 +662,7 @@ function withPatchOwnership(edge: DeckGraphEdge, patch: DeckGraphPatch): DeckGra
 }
 
 export function generateCardGraphPatch(deck: DeckSnapshot, graph: DeckGraph, cardId: string, prompt?: string): DeckGraphPatch {
+  const startedAt = performance.now();
   const profile = createCardProfiles(deck).find((item) => item.entry.id === cardId);
   if (!profile) {
     throw new Error("Card must be resolved before graph enrichment can analyze it.");
@@ -768,7 +776,185 @@ export function generateCardGraphPatch(deck: DeckSnapshot, graph: DeckGraph, car
     nodesToUpsert,
     edgesToUpsert: dedupeEdges(edgesToUpsert),
     edgeFunctions,
+    generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    promptText: makeGraphPatchPromptSummary("Analyze card graph", `${profile.entry.name} in ${deck.name}`, prompt),
+    reasoningSummary: makeGraphPatchExecutionSummary({
+      cardName: profile.entry.name,
+      nodesToUpsert,
+      edgesToUpsert: dedupeEdges(edgesToUpsert),
+      edgeFunctions,
+      notes,
+      customPrompt,
+      mode: "card",
+    }),
     notes: notes.length ? notes : [`${profile.entry.name} did not produce additional card-level AI edges from the current heuristics.`],
+    generatedAt: new Date().toISOString(),
+    source: "ai",
+  };
+}
+
+export function generateCardGraphLitePatch(deckId: string, card: DeckEntry, prompt?: string): DeckGraphPatch {
+  const startedAt = performance.now();
+  if (card.unresolved) {
+    throw new Error("Card must be resolved before graph enrichment can analyze it.");
+  }
+
+  const cardId = card.id;
+  const sourceNodeId = cardNodeId(cardId);
+  const text = `${card.name} ${getPrimaryTypeLine(card)} ${getOracleText(card)}`.toLowerCase();
+  const edgeFunctions: GraphEdgeFunction[] = [];
+  const notes: string[] = [];
+  const customPrompt = prompt?.trim();
+  const addFunction = (edgeFunction: GraphEdgeFunction, note: string) => {
+    if (!edgeFunctions.some((item) => item.id === edgeFunction.id)) {
+      edgeFunctions.push(edgeFunction);
+      notes.push(note);
+    }
+  };
+
+  if (text.includes("whenever you cast a noncreature spell")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:noncreature-spells`,
+        sourceId: sourceNodeId,
+        kind: "pays_off",
+        selector: {
+          attributes: [
+            { path: "card.is_nonland", op: "equals", value: true },
+            { path: "card.type_line_all", op: "notContains", value: "Creature" },
+          ],
+        },
+        customMessage: `${card.name} rewards casting this noncreature spell.`,
+        strength: 5,
+      },
+      `${card.name} has a noncreature-spell payoff.`,
+    );
+  }
+
+  if (text.includes("four or more wizards") || (text.includes("wizard") && text.includes("transform"))) {
+    addFunction(
+      {
+        id: `fn:${cardId}:wizard-threshold`,
+        targetId: sourceNodeId,
+        kind: "enables",
+        sourceSelector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Wizard" }] },
+        customMessage: `This Wizard helps ${card.name} reach its Wizard threshold.`,
+        strength: 4,
+      },
+      `${card.name} has a Wizard threshold or transform condition.`,
+    );
+  }
+
+  if (text.includes("soldier")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:soldiers`,
+        sourceId: sourceNodeId,
+        kind: text.includes("whenever") || text.includes("gets") || text.includes("tokens you control") ? "pays_off" : "supports",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Soldier" }] },
+        customMessage: `${card.name} has rules text that connects it to Soldier cards.`,
+        strength: 4,
+        connectionGroup: "Soldiers",
+      },
+      `${card.name} references Soldier cards or Soldier payoffs.`,
+    );
+  }
+
+  if (text.includes("artifact") && text.includes("graveyard")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:artifact-graveyard`,
+        sourceId: sourceNodeId,
+        kind: "enables",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Artifact" }] },
+        customMessage: `${card.name} specifically references artifact cards in the graveyard.`,
+        strength: 5,
+        connectionGroup: "Artifact recursion",
+      },
+      `${card.name} connects artifacts with graveyard access.`,
+    );
+  } else if (text.includes("artifact")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:artifacts`,
+        sourceId: sourceNodeId,
+        kind: "supports",
+        selector: { attributes: [{ path: "card.type_line_all", op: "contains", value: "Artifact" }] },
+        customMessage: `${card.name} has rules text that connects it to artifact cards.`,
+        strength: 3,
+        connectionGroup: "Artifacts",
+      },
+      `${card.name} references artifacts.`,
+    );
+  }
+
+  if (text.includes("tokens you control") || text.includes("token")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:tokens`,
+        sourceId: sourceNodeId,
+        kind: text.includes("tokens you control") || text.includes("whenever") ? "pays_off" : "supports",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "token" }] },
+        customMessage: `${card.name} has token-relevant rules text.`,
+        strength: text.includes("tokens you control") ? 4 : 3,
+        connectionGroup: "Tokens",
+      },
+      `${card.name} references tokens.`,
+    );
+  }
+
+  if (text.includes("sacrifice")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:sacrifice`,
+        sourceId: sourceNodeId,
+        kind: "enables",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "dies" }] },
+        customMessage: `${card.name} can connect to cards that care about creatures or permanents dying.`,
+        strength: 4,
+        connectionGroup: "Sacrifice",
+      },
+      `${card.name} includes sacrifice text.`,
+    );
+  }
+
+  if (text.includes("graveyard")) {
+    addFunction(
+      {
+        id: `fn:${cardId}:graveyard`,
+        sourceId: sourceNodeId,
+        kind: "supports",
+        selector: { attributes: [{ path: "card.oracle_text_all", op: "contains", value: "graveyard" }] },
+        customMessage: `${card.name} has graveyard-relevant rules text.`,
+        strength: 3,
+        connectionGroup: "Graveyard",
+      },
+      `${card.name} references graveyards.`,
+    );
+  }
+
+  if (customPrompt) notes.push(`Custom prompt considered: ${customPrompt}`);
+
+  return {
+    id: `patch_${cardId}_lite_${Date.now()}`,
+    deckId,
+    cardId,
+    nodesToUpsert: [],
+    edgesToUpsert: [],
+    edgeFunctions,
+    edgeIdsToRemove: [],
+    generationTimeMs: Math.max(0, Math.round(performance.now() - startedAt)),
+    promptText: makeGraphPatchLitePromptSummary(card.name, prompt),
+    reasoningSummary: makeGraphPatchExecutionSummary({
+      cardName: card.name,
+      nodesToUpsert: [],
+      edgesToUpsert: [],
+      edgeFunctions,
+      notes,
+      customPrompt,
+      mode: "card",
+    }),
+    notes: notes.length ? notes : [`${card.name} did not produce card-only edge functions from the current heuristics.`],
     generatedAt: new Date().toISOString(),
     source: "ai",
   };
@@ -789,6 +975,61 @@ export function describeGraphNode(node: DeckGraphNode, graph: DeckGraph): string
     ? `Connected to ${connected.nodes.slice(0, 5).map((item) => item.label).join(", ")}${connected.nodes.length > 5 ? " and more" : ""}.`
     : "No graph connections are currently visible.";
   return `${node.summary} ${connectionText}`;
+}
+
+function makeGraphPatchPromptSummary(task: string, subject: string, prompt?: string): string {
+  return [
+    `Task: ${task}`,
+    `Subject: ${subject}`,
+    prompt?.trim() ? `Custom prompt: ${prompt.trim()}` : "Custom prompt: (none)",
+    "Use the deck snapshot and current graph to return a DeckGraphPatch with high-signal nodes, edges, edge functions, notes, and evidence.",
+  ].join("\n");
+}
+
+function makeGraphPatchLitePromptSummary(cardName: string, prompt?: string): string {
+  return [
+    "Task: Analyze card graph lite",
+    `Subject: ${cardName}`,
+    prompt?.trim() ? `Custom prompt: ${prompt.trim()}` : "Custom prompt: (none)",
+    "Use only the selected card to return a DeckGraphPatch containing edgeFunctions only.",
+  ].join("\n");
+}
+
+function makeGraphPatchExecutionSummary({
+  cardName,
+  nodesToUpsert,
+  edgesToUpsert,
+  edgeFunctions,
+  notes,
+  customPrompt,
+  mode,
+}: {
+  cardName: string;
+  nodesToUpsert: DeckGraphNode[];
+  edgesToUpsert: DeckGraphEdge[];
+  edgeFunctions: GraphEdgeFunction[];
+  notes: string[];
+  customPrompt?: string;
+  mode: "card" | "deck";
+}): string {
+  const lines: string[] = [];
+  lines.push(mode === "card" ? `- looked at ${cardName} as the selected graph card` : `- looked across ${cardName} for deck-level graph groups`);
+  if (customPrompt) lines.push(`- applied custom prompt: ${customPrompt}`);
+  nodesToUpsert
+    .filter((node) => node.kind !== "card")
+    .slice(0, 3)
+    .forEach((node) => lines.push(`- made ${node.kind} node "${node.label}"`));
+  edgesToUpsert.slice(0, 4).forEach((edge) => {
+    const label = edge.connectionGroup ? `${edge.kind} (${edge.connectionGroup})` : edge.kind;
+    lines.push(`- added ${label} edge ${edge.sourceId} -> ${edge.targetId}`);
+  });
+  edgeFunctions.slice(0, 4).forEach((edgeFunction) => {
+    const direction = edgeFunction.targetId ? `to ${edgeFunction.targetId}` : edgeFunction.sourceId ? `from ${edgeFunction.sourceId}` : "for matching cards";
+    const group = edgeFunction.connectionGroup ? ` in "${edgeFunction.connectionGroup}"` : "";
+    lines.push(`- made edgeFunction ${edgeFunction.id} ${direction}${group}`);
+  });
+  notes.slice(0, 3).forEach((note) => lines.push(`- noted ${note}`));
+  return Array.from(new Set(lines)).slice(0, 8).join("\n");
 }
 
 function createCardProfiles(deck: DeckSnapshot): CardProfile[] {

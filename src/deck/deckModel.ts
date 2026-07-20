@@ -59,6 +59,13 @@ export type DeckSnapshot = {
   entries: DeckEntry[];
   importedAt: string;
   updatedAt: string;
+  source?: {
+    type: "archidekt";
+    url: string;
+    deckId: string;
+    name?: string;
+    lastSyncedAt?: string;
+  };
 };
 
 export type DeckCategory =
