@@ -1,9 +1,9 @@
-import { Copy, MoreHorizontal, Trash2 } from "lucide-react";
+import { Copy, Lock, MoreHorizontal, Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ReactNode } from "react";
+import type { DragEvent, ReactNode } from "react";
 import type { HoverPreviewHandlers } from "../../app/App";
 import { DeckGraphEdge, DeckGraphNode } from "../../deck/deckGraph";
-import { DeckSnapshot } from "../../deck/deckModel";
+import { DeckEntry, DeckSnapshot, getPrimaryTypeLine } from "../../deck/deckModel";
 import { getCardById } from "../../deck/deckQueries";
 import { DeckStackCard } from "../deck-card/DeckStackCard";
 
@@ -24,9 +24,18 @@ type ConnectionGroup = {
   id: string;
   label: string;
   kind?: DeckGraphEdge["kind"];
+  addKind: DeckGraphEdge["kind"];
+  connectionGroup?: string;
+  edgeIds: string[];
+  edgeFunctionIds: string[];
   directItems: ConnectionItem[];
   functionGroups: EdgeFunctionConnectionGroup[];
   entryCount: number;
+};
+
+type DraggedConnection = {
+  edgeId: string;
+  sourceGroupId: string;
 };
 
 const CONNECTION_KIND_ORDER: DeckGraphEdge["kind"][] = ["enables", "pays_off", "supports", "protects", "answers", "depends_on", "weak_to", "belongs_to"];
@@ -40,6 +49,9 @@ export function GraphConnections({
   onOpenCard,
   onDeleteEdge,
   onDeleteEdges,
+  onMoveCardConnection,
+  onRenameConnectionGroup,
+  onAddCardConnectionToGroup,
   onCopyConnectionsJson,
   onDeleteConnectionsPatch,
   hoverPreview,
@@ -52,11 +64,20 @@ export function GraphConnections({
   onOpenCard: (cardId: string) => void;
   onDeleteEdge?: (edgeId: string) => void;
   onDeleteEdges?: (edgeIds: string[], label?: string) => void;
+  onMoveCardConnection?: (edgeId: string, connectionGroup: string | undefined) => void;
+  onRenameConnectionGroup?: (edgeIds: string[], edgeFunctionIds: string[], connectionGroup: string) => void;
+  onAddCardConnectionToGroup?: (cardId: string, selectedNodeId: string, kind: DeckGraphEdge["kind"], connectionGroup: string | undefined) => void;
   onCopyConnectionsJson?: () => void;
   onDeleteConnectionsPatch?: () => void;
   hoverPreview?: HoverPreviewHandlers;
 }) {
   const [openActionMenuId, setOpenActionMenuId] = useState<string>();
+  const [draggedConnection, setDraggedConnection] = useState<DraggedConnection>();
+  const [activeDropGroupId, setActiveDropGroupId] = useState<string>();
+  const [editingGroupId, setEditingGroupId] = useState<string>();
+  const [editingGroupLabel, setEditingGroupLabel] = useState("");
+  const [openAddMenuGroupId, setOpenAddMenuGroupId] = useState<string>();
+  const [addConnectionSearch, setAddConnectionSearch] = useState("");
   useEffect(() => {
     if (!openActionMenuId) return;
     const handlePointerDown = (event: PointerEvent) => {
@@ -74,6 +95,26 @@ export function GraphConnections({
     };
   }, [openActionMenuId]);
 
+  useEffect(() => {
+    if (!openAddMenuGroupId) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Element && event.target.closest(".graph-add-connection-menu")) return;
+      setOpenAddMenuGroupId(undefined);
+      setAddConnectionSearch("");
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setOpenAddMenuGroupId(undefined);
+      setAddConnectionSearch("");
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [openAddMenuGroupId]);
+
   if (!nodes.length) {
     return (
       <div className="graph-connections">
@@ -89,6 +130,13 @@ export function GraphConnections({
   }
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
   const groups = groupConnections(deck, edges, nodeById, selectedNodeId);
+  const finishEditingGroup = (group: ConnectionGroup) => {
+    const nextLabel = editingGroupLabel.trim();
+    setEditingGroupId(undefined);
+    setEditingGroupLabel("");
+    if (!nextLabel || nextLabel === group.label) return;
+    onRenameConnectionGroup?.(group.edgeIds, group.edgeFunctionIds, nextLabel);
+  };
   return (
     <div className="graph-connections">
       <GraphConnectionsHeading
@@ -97,11 +145,99 @@ export function GraphConnections({
         onCopyConnectionsJson={onCopyConnectionsJson}
         onDeleteConnectionsPatch={onDeleteConnectionsPatch}
       />
-      {groups.map((group) => (
-        <div className="graph-connection-group" key={group.id}>
-          <div className="graph-connection-group-heading">
-            <span>{group.label}</span>
-            <strong>{group.entryCount}</strong>
+      {groups.map((group) => {
+        const canDropConnection = Boolean(onMoveCardConnection && draggedConnection && draggedConnection.sourceGroupId !== group.id);
+        return (
+        <div
+          className={`graph-connection-group ${canDropConnection ? "can-drop-connection" : ""} ${activeDropGroupId === group.id ? "drop-target-active" : ""}`}
+          key={group.id}
+          onDragOver={(event) => {
+            if (!canDropConnection) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+            setActiveDropGroupId(group.id);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setActiveDropGroupId(undefined);
+          }}
+          onDrop={(event) => {
+            if (!canDropConnection || !draggedConnection) return;
+            event.preventDefault();
+            onMoveCardConnection?.(draggedConnection.edgeId, group.connectionGroup);
+            setDraggedConnection(undefined);
+            setActiveDropGroupId(undefined);
+          }}
+        >
+          <div
+            className={`graph-connection-group-heading ${onRenameConnectionGroup ? "is-editable" : ""}`}
+            onDoubleClick={() => {
+              if (!onRenameConnectionGroup) return;
+              setEditingGroupId(group.id);
+              setEditingGroupLabel(group.label);
+            }}
+          >
+            {editingGroupId === group.id ? (
+              <input
+                className="graph-connection-group-name-input"
+                value={editingGroupLabel}
+                autoFocus
+                aria-label={`Rename ${group.label} connection group`}
+                onChange={(event) => setEditingGroupLabel(event.target.value)}
+                onClick={(event) => event.stopPropagation()}
+                onDoubleClick={(event) => event.stopPropagation()}
+                onBlur={() => finishEditingGroup(group)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setEditingGroupId(undefined);
+                    setEditingGroupLabel("");
+                  }
+                }}
+              />
+            ) : (
+              <span title={onRenameConnectionGroup ? "Double-click to rename" : undefined}>{group.label}</span>
+            )}
+            <div className="graph-connection-group-count-actions">
+              <strong>{group.entryCount}</strong>
+              {onAddCardConnectionToGroup && (
+                <div className={`graph-add-connection-menu ${openAddMenuGroupId === group.id ? "open" : ""}`}>
+                  <button
+                    type="button"
+                    className="graph-add-connection-trigger"
+                    aria-label={`Add card connection to ${group.label}`}
+                    title={`Add card connection to ${group.label}`}
+                    aria-expanded={openAddMenuGroupId === group.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setEditingGroupId(undefined);
+                      setOpenAddMenuGroupId(openAddMenuGroupId === group.id ? undefined : group.id);
+                      setAddConnectionSearch("");
+                    }}
+                    onDoubleClick={(event) => event.stopPropagation()}
+                  >
+                    <Plus size={14} />
+                  </button>
+                  {openAddMenuGroupId === group.id && (
+                    <AddConnectionMenu
+                      deck={deck}
+                      group={group}
+                      selectedNodeId={selectedNodeId}
+                      search={addConnectionSearch}
+                      onSearchChange={setAddConnectionSearch}
+                      onAdd={(cardId) => {
+                        onAddCardConnectionToGroup(cardId, selectedNodeId, group.addKind, group.connectionGroup);
+                        setOpenAddMenuGroupId(undefined);
+                        setAddConnectionSearch("");
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
           </div>
           <div id={`graph-connection-group-${selectedNodeId}-${group.id}`} className="graph-connection-group-items">
             {group.functionGroups.slice(0, 10).map((functionGroup) => (
@@ -145,6 +281,12 @@ export function GraphConnections({
                         hoverPreview,
                         openActionMenuId,
                         setOpenActionMenuId,
+                        group.id,
+                        onMoveCardConnection ? setDraggedConnection : undefined,
+                        () => {
+                          setDraggedConnection(undefined);
+                          setActiveDropGroupId(undefined);
+                        },
                       ),
                     )}
                 </div>
@@ -163,11 +305,18 @@ export function GraphConnections({
                   hoverPreview,
                   openActionMenuId,
                   setOpenActionMenuId,
+                  group.id,
+                  onMoveCardConnection ? setDraggedConnection : undefined,
+                  () => {
+                    setDraggedConnection(undefined);
+                    setActiveDropGroupId(undefined);
+                  },
                 ),
               )}
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -203,6 +352,73 @@ function GraphConnectionsHeading({
   );
 }
 
+function AddConnectionMenu({
+  deck,
+  group,
+  selectedNodeId,
+  search,
+  onSearchChange,
+  onAdd,
+}: {
+  deck: DeckSnapshot;
+  group: ConnectionGroup;
+  selectedNodeId: string;
+  search: string;
+  onSearchChange: (value: string) => void;
+  onAdd: (cardId: string) => void;
+}) {
+  const connectedCardNodeIds = new Set(
+    [...group.directItems, ...group.functionGroups.flatMap((functionGroup) => functionGroup.items)]
+      .map((item) => item.node.id)
+      .filter((nodeId) => nodeId.startsWith("card:")),
+  );
+  const query = search.trim().toLowerCase();
+  const cards = deck.entries
+    .filter((entry) => !entry.unresolved)
+    .filter((entry) => `card:${entry.id}` !== selectedNodeId)
+    .filter((entry) => !connectedCardNodeIds.has(`card:${entry.id}`))
+    .filter((entry) => {
+      if (!query) return true;
+      return `${entry.name} ${getPrimaryTypeLine(entry)}`.toLowerCase().includes(query);
+    })
+    .sort(sortDeckEntriesByName)
+    .slice(0, 8);
+  return (
+    <div className="graph-add-connection-dropdown" role="dialog" aria-label={`Add card to ${group.label}`}>
+      <input
+        className="graph-add-connection-search"
+        value={search}
+        autoFocus
+        placeholder="Search deck cards"
+        aria-label="Search deck cards"
+        onChange={(event) => onSearchChange(event.target.value)}
+        onClick={(event) => event.stopPropagation()}
+        onDoubleClick={(event) => event.stopPropagation()}
+      />
+      <div className="graph-add-connection-results">
+        {cards.length ? (
+          cards.map((card) => (
+            <button
+              type="button"
+              className="graph-add-connection-result"
+              key={card.id}
+              onClick={(event) => {
+                event.stopPropagation();
+                onAdd(card.id);
+              }}
+            >
+              <strong>{card.name}</strong>
+              <span>{getPrimaryTypeLine(card) || "Unresolved card"}</span>
+            </button>
+          ))
+        ) : (
+          <p>No matching cards.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function groupConnections(
   deck: DeckSnapshot,
   edges: DeckGraphEdge[],
@@ -211,7 +427,14 @@ function groupConnections(
 ): ConnectionGroup[] {
   const groups = new Map<
     string,
-    { label: string; kind?: DeckGraphEdge["kind"]; directItems: ConnectionItem[]; functionGroups: Map<string, EdgeFunctionConnectionGroup> }
+    {
+      label: string;
+      kind?: DeckGraphEdge["kind"];
+      edgeIds: string[];
+      edgeFunctionIds: Set<string>;
+      directItems: ConnectionItem[];
+      functionGroups: Map<string, EdgeFunctionConnectionGroup>;
+    }
   >();
   edges.forEach((edge) => {
     const otherNodeId = edge.sourceId === selectedNodeId ? edge.targetId : edge.targetId === selectedNodeId ? edge.sourceId : undefined;
@@ -223,11 +446,15 @@ function groupConnections(
     const group = groups.get(groupId) ?? {
       label: customLabel || connectionKindLabel(edge.kind),
       kind: customLabel ? undefined : edge.kind,
+      edgeIds: [],
+      edgeFunctionIds: new Set<string>(),
       directItems: [],
       functionGroups: new Map<string, EdgeFunctionConnectionGroup>(),
     };
+    group.edgeIds.push(edge.id);
     const item = { node, edge };
     if (edge.generatedByFunctionId) {
+      group.edgeFunctionIds.add(edge.generatedByFunctionId);
       const functionGroupId = `${groupId}:function:${edge.generatedByFunctionId}`;
       const functionGroup = group.functionGroups.get(functionGroupId) ?? {
         id: functionGroupId,
@@ -248,6 +475,10 @@ function groupConnections(
       id,
       label: group.label,
       kind: group.kind,
+      addKind: group.directItems[0]?.edge.kind ?? Array.from(group.functionGroups.values())[0]?.items[0]?.edge.kind ?? group.kind ?? "supports",
+      connectionGroup: group.kind ? undefined : group.label,
+      edgeIds: group.edgeIds,
+      edgeFunctionIds: Array.from(group.edgeFunctionIds),
       directItems: group.directItems.sort(sortConnectionItems),
       functionGroups: Array.from(group.functionGroups.values())
         .map((functionGroup) => ({ ...functionGroup, items: functionGroup.items.sort(sortConnectionItems) }))
@@ -255,6 +486,10 @@ function groupConnections(
       entryCount: group.directItems.length + Array.from(group.functionGroups.values()).reduce((total, functionGroup) => total + functionGroup.items.length, 0),
     }))
     .sort((a, b) => b.entryCount - a.entryCount || groupSortIndex(a.kind) - groupSortIndex(b.kind) || a.label.localeCompare(b.label));
+}
+
+function sortDeckEntriesByName(a: DeckEntry, b: DeckEntry): number {
+  return a.name.localeCompare(b.name);
 }
 
 function renderConnectionRow(
@@ -267,14 +502,31 @@ function renderConnectionRow(
   hoverPreview: HoverPreviewHandlers | undefined,
   openActionMenuId: string | undefined,
   setOpenActionMenuId: (menuId: string | undefined) => void,
+  groupId: string,
+  setDraggedConnection: ((value: DraggedConnection | undefined) => void) | undefined,
+  onDragEnd: () => void,
 ): ReactNode {
   const connectionName = node.cardId ? getCardById(deck, node.cardId)?.name ?? node.label : node.label;
   const connectionText = edgeLabel(edge, selectedNodeId, connectionName, deck);
+  const isGeneratedConnection = Boolean(edge.generatedByFunctionId);
+  const canDragConnection = Boolean(setDraggedConnection && node.cardId && !isGeneratedConnection);
+  const handleDragStart = (event: DragEvent<HTMLDivElement>) => {
+    if (!canDragConnection) return;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", edge.id);
+    setDraggedConnection?.({ edgeId: edge.id, sourceGroupId: groupId });
+  };
   if (node.cardId) {
     const card = getCardById(deck, node.cardId);
     if (card) {
       return (
-        <div key={`${edge.id}:${node.id}`} className="graph-card-connection-row">
+        <div
+          key={`${edge.id}:${node.id}`}
+          className={`graph-card-connection-row ${canDragConnection ? "is-draggable" : ""} ${isGeneratedConnection ? "is-generated-connection" : ""}`}
+          draggable={canDragConnection}
+          onDragStart={handleDragStart}
+          onDragEnd={onDragEnd}
+        >
           <DeckStackCard
             entry={card}
             className="graph-connection-card"
@@ -293,6 +545,11 @@ function renderConnectionRow(
               deleteLabel="Delete edge"
               onDelete={() => onDeleteEdge(edge.id)}
             />
+          )}
+          {isGeneratedConnection && (
+            <span className="graph-generated-lock" title="Generated by an edgeFunction" aria-label="Generated by an edgeFunction">
+              <Lock size={13} />
+            </span>
           )}
           <span className="connection-tooltip" role="tooltip">
             {connectionText}

@@ -110,6 +110,9 @@ export function DeckGraphView({
   onDeleteNode,
   onDeleteEdge,
   onDeleteEdges,
+  onMoveCardConnection,
+  onRenameConnectionGroup,
+  onAddCardConnectionToGroup,
   onCopyConnectionsJson,
   onDeleteConnectionsPatch,
   onResetHiddenNodes,
@@ -134,6 +137,9 @@ export function DeckGraphView({
   onDeleteNode?: (nodeId: string) => void;
   onDeleteEdge?: (edgeId: string) => void;
   onDeleteEdges?: (edgeIds: string[], label?: string) => void;
+  onMoveCardConnection?: (edgeId: string, connectionGroup: string | undefined) => void;
+  onRenameConnectionGroup?: (edgeIds: string[], edgeFunctionIds: string[], connectionGroup: string) => void;
+  onAddCardConnectionToGroup?: (cardId: string, selectedNodeId: string, kind: DeckGraphEdge["kind"], connectionGroup: string | undefined) => void;
   onCopyConnectionsJson?: () => void;
   onDeleteConnectionsPatch?: () => void;
   onResetHiddenNodes?: () => void;
@@ -187,6 +193,9 @@ export function DeckGraphView({
       onOpenCard={onOpenCard}
       onDeleteEdge={onDeleteEdge}
       onDeleteEdges={onDeleteEdges}
+      onMoveCardConnection={onMoveCardConnection}
+      onRenameConnectionGroup={onRenameConnectionGroup}
+      onAddCardConnectionToGroup={onAddCardConnectionToGroup}
       onCopyConnectionsJson={onCopyConnectionsJson}
       onDeleteConnectionsPatch={onDeleteConnectionsPatch}
       hoverPreview={hoverPreview}

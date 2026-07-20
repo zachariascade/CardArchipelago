@@ -1248,6 +1248,21 @@ textarea {
 .graph-connection-group {
   display: grid;
   gap: 5px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0 2px 2px;
+  transition:
+    background 140ms ease,
+    border-color 140ms ease;
+}
+
+.graph-connection-group.can-drop-connection {
+  border-color: #d8cbc0;
+}
+
+.graph-connection-group.drop-target-active {
+  border-color: #2c7568;
+  background: #eef7f2;
 }
 
 .graph-connection-group-heading {
@@ -1270,10 +1285,35 @@ textarea {
   text-align: left;
 }
 
+.graph-connection-group-heading.is-editable {
+  cursor: text;
+}
+
 .graph-connection-group-heading span {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+}
+
+.graph-connection-group-name-input {
+  width: min(240px, 100%);
+  min-width: 120px;
+  border: 1px solid #c8b8aa;
+  border-radius: 6px;
+  background: #fffdf8;
+  color: #202426;
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 850;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  outline: none;
+}
+
+.graph-connection-group-name-input:focus {
+  border-color: #2c7568;
+  box-shadow: 0 0 0 3px rgba(44, 117, 104, 0.16);
 }
 
 .graph-connection-group-items {
@@ -1284,6 +1324,123 @@ textarea {
 .graph-connection-group-heading strong {
   color: #9aa3a6;
   font-weight: 700;
+}
+
+.graph-connection-group-count-actions {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.graph-add-connection-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.graph-add-connection-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid #2c7568;
+  border-radius: 999px;
+  background: #eef7f2;
+  color: #2c7568;
+  padding: 0;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(46, 39, 31, 0.08);
+}
+
+.graph-add-connection-trigger:hover,
+.graph-add-connection-trigger:focus-visible,
+.graph-add-connection-menu.open .graph-add-connection-trigger {
+  border-color: #2c7568;
+  background: #2c7568;
+  color: #2c7568;
+  color: #fffdf8;
+  outline: none;
+}
+
+.graph-add-connection-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 130;
+  display: grid;
+  gap: 8px;
+  width: min(300px, calc(100vw - 32px));
+  border: 1px solid #d8cbc0;
+  border-radius: 8px;
+  background: #fffdf8;
+  box-shadow: 0 16px 42px rgba(46, 39, 31, 0.2);
+  padding: 9px;
+}
+
+.graph-add-connection-search {
+  width: 100%;
+  border: 1px solid #d8cbc0;
+  border-radius: 6px;
+  background: #fff;
+  color: #202426;
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  outline: none;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.graph-add-connection-search:focus {
+  border-color: #2c7568;
+  box-shadow: 0 0 0 3px rgba(44, 117, 104, 0.14);
+}
+
+.graph-add-connection-results {
+  display: grid;
+  gap: 4px;
+  max-height: 264px;
+  overflow: auto;
+}
+
+.graph-add-connection-result {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #202426;
+  padding: 7px 8px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-add-connection-result:hover,
+.graph-add-connection-result:focus-visible {
+  border-color: #d8cbc0;
+  background: #f7f2ea;
+  outline: none;
+}
+
+.graph-add-connection-result strong {
+  color: #202426;
+  font-size: 0.84rem;
+  font-weight: 800;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.graph-add-connection-result span,
+.graph-add-connection-results p {
+  margin: 0;
+  color: #687075;
+  font-size: 0.74rem;
+  font-weight: 550;
+  text-transform: none;
+  letter-spacing: 0;
 }
 
 .graph-connection-row {
@@ -1314,6 +1471,18 @@ textarea {
   margin: 0;
   max-height: 36px;
   transition: max-height 190ms ease;
+}
+
+.graph-card-connection-row.is-draggable {
+  cursor: grab;
+}
+
+.graph-card-connection-row.is-draggable:active {
+  cursor: grabbing;
+}
+
+.graph-card-connection-row.is-generated-connection {
+  opacity: 0.78;
 }
 
 .graph-card-connection-row:last-child,
@@ -1370,6 +1539,20 @@ textarea {
 .graph-card-edge-action-menu.open {
   visibility: visible;
   opacity: 1;
+}
+
+.graph-generated-lock {
+  grid-column: 2;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 24px;
+  margin-top: 6px;
+  border: 1px solid #e0d7ca;
+  border-radius: 6px;
+  background: #f7f2ea;
+  color: #7f878a;
 }
 
 .graph-edge-function-group {

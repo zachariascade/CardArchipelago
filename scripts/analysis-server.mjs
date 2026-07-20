@@ -8,7 +8,7 @@ import { join } from "node:path";
 const PORT = Number(process.env.MTG_ANALYSIS_PORT ?? 8787);
 const RUNNER = process.env.MTG_ANALYSIS_RUNNER ?? "scaffold";
 const CODEX_BIN = process.env.CODEX_BIN ?? "/Applications/Codex.app/Contents/Resources/codex";
-const CODEX_TIMEOUT_MS = Number(process.env.MTG_CODEX_TIMEOUT_MS ?? 120_000);
+const CODEX_TIMEOUT_MS = Number(process.env.MTG_CODEX_TIMEOUT_MS ?? 180_000);
 const DEFAULT_CODEX_MODEL = process.env.MTG_CODEX_MODEL ?? "gpt-5.4";
 const DEFAULT_CODEX_REASONING_EFFORT = process.env.MTG_CODEX_REASONING_EFFORT ?? "low";
 const EDGE_FUNCTION_ATTRIBUTE_REFERENCE = loadEdgeFunctionAttributeReference();

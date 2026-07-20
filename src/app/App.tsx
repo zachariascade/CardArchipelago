@@ -18,6 +18,9 @@ import { ProviderConfig, QuestionThread, StoredDeckGraphState, loadStoredState, 
 
 const EDGE_DELETIONS_PATCH_KEY = "__edge_deletions__";
 const NODE_DELETIONS_PATCH_KEY = "__node_deletions__";
+const CONNECTION_MOVES_PATCH_KEY = "__connection_moves__";
+const CONNECTION_RENAMES_PATCH_KEY = "__connection_renames__";
+const CONNECTION_ADDITIONS_PATCH_KEY = "__connection_additions__";
 const DECK_ANALYSIS_PATCH_KEY = "__deck_analysis__";
 
 export type HoverPreviewHandlers = {
@@ -134,7 +137,14 @@ export function App() {
   const activeGraphState = deck ? graphStateByDeckId[deck.id] ?? {} : {};
   const deckGraphPatches = useMemo(() => (deck ? Object.values(graphPatchesByDeckId[deck.id] ?? {}) : []), [deck, graphPatchesByDeckId]);
   const deckGraphPatchCount = deck
-    ? Object.keys(graphPatchesByDeckId[deck.id] ?? {}).filter((key) => key !== EDGE_DELETIONS_PATCH_KEY && key !== NODE_DELETIONS_PATCH_KEY).length
+    ? Object.keys(graphPatchesByDeckId[deck.id] ?? {}).filter(
+        (key) =>
+          key !== EDGE_DELETIONS_PATCH_KEY &&
+          key !== NODE_DELETIONS_PATCH_KEY &&
+          key !== CONNECTION_MOVES_PATCH_KEY &&
+          key !== CONNECTION_RENAMES_PATCH_KEY &&
+          key !== CONNECTION_ADDITIONS_PATCH_KEY,
+      ).length
     : 0;
   const deckAnalysisGraphPatch = deck ? graphPatchesByDeckId[deck.id]?.[DECK_ANALYSIS_PATCH_KEY] : undefined;
   const deckGraph = useMemo(() => (deck ? applyGraphPatches(buildDeckGraph(deck), deckGraphPatches, deck) : undefined), [deck, deckGraphPatches]);
@@ -722,9 +732,15 @@ export function App() {
     setGraphPatchesByDeckId((current) => {
       const deletionPatch = current[deck.id]?.[EDGE_DELETIONS_PATCH_KEY];
       const nodeDeletionPatch = current[deck.id]?.[NODE_DELETIONS_PATCH_KEY];
+      const connectionMovesPatch = current[deck.id]?.[CONNECTION_MOVES_PATCH_KEY];
+      const connectionRenamesPatch = current[deck.id]?.[CONNECTION_RENAMES_PATCH_KEY];
+      const connectionAdditionsPatch = current[deck.id]?.[CONNECTION_ADDITIONS_PATCH_KEY];
       const nextDeckPatches: Record<string, DeckGraphPatch> = {};
       if (deletionPatch) nextDeckPatches[EDGE_DELETIONS_PATCH_KEY] = deletionPatch;
       if (nodeDeletionPatch) nextDeckPatches[NODE_DELETIONS_PATCH_KEY] = nodeDeletionPatch;
+      if (connectionMovesPatch) nextDeckPatches[CONNECTION_MOVES_PATCH_KEY] = connectionMovesPatch;
+      if (connectionRenamesPatch) nextDeckPatches[CONNECTION_RENAMES_PATCH_KEY] = connectionRenamesPatch;
+      if (connectionAdditionsPatch) nextDeckPatches[CONNECTION_ADDITIONS_PATCH_KEY] = connectionAdditionsPatch;
       return {
         ...current,
         [deck.id]: nextDeckPatches,
@@ -817,6 +833,186 @@ export function App() {
         },
       };
     });
+  }
+
+  function moveCardConnection(edgeId: string, connectionGroup: string | undefined) {
+    if (!deck || !deckGraph) return;
+    const edge = deckGraph.edges.find((item) => item.id === edgeId);
+    if (!edge || edge.generatedByFunctionId) return;
+    const sourceNode = deckGraph.nodes.find((node) => node.id === edge.sourceId);
+    const targetNode = deckGraph.nodes.find((node) => node.id === edge.targetId);
+    if (!sourceNode?.cardId && !targetNode?.cardId) return;
+    const targetConnectionGroup = connectionGroup?.trim() || undefined;
+    if ((edge.connectionGroup?.trim() || undefined) === targetConnectionGroup) return;
+    const movedEdge = normalizeDeckGraphEdgeId({
+      ...edge,
+      id: `${edge.sourceId}->${edge.targetId}:${edge.kind}`,
+      connectionGroup: targetConnectionGroup,
+      evidence: edge.evidence
+        ? `${edge.evidence} Manually moved to ${targetConnectionGroup ?? edge.kind}.`
+        : `Manually moved to ${targetConnectionGroup ?? edge.kind}.`,
+      generatedByFunctionId: undefined,
+    });
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = current[deck.id] ?? {};
+      const currentPatch = deckPatches[CONNECTION_MOVES_PATCH_KEY];
+      const removedEdgeIds = Array.from(new Set([...(currentPatch?.edgeIdsToRemove ?? []), edge.id])).filter((id) => id !== movedEdge.id);
+      const edgesToUpsert = [...(currentPatch?.edgesToUpsert ?? []).filter((item) => item.id !== edge.id && item.id !== movedEdge.id), movedEdge];
+      const movePatch: DeckGraphPatch = {
+        id: currentPatch?.id ?? `patch_${deck.id}_connection_moves`,
+        deckId: deck.id,
+        cardId: CONNECTION_MOVES_PATCH_KEY,
+        nodesToUpsert: [],
+        edgesToUpsert,
+        edgeFunctions: [],
+        edgeIdsToRemove: removedEdgeIds,
+        notes: [`${edgesToUpsert.length} card connection${edgesToUpsert.length === 1 ? "" : "s"} manually moved.`],
+        generatedAt: new Date().toISOString(),
+        source: "ai",
+      };
+      return {
+        ...current,
+        [deck.id]: {
+          ...deckPatches,
+          [CONNECTION_MOVES_PATCH_KEY]: movePatch,
+        },
+      };
+    });
+    setDeckGraphPatchStatus(`Moved connection to ${targetConnectionGroup ?? edge.kind}.`);
+    setDeckGraphPatchError(undefined);
+  }
+
+  function renameConnectionGroup(edgeIds: string[], edgeFunctionIds: string[], connectionGroup: string) {
+    if (!deck || !deckGraph) return;
+    const targetConnectionGroup = connectionGroup.trim();
+    if (!targetConnectionGroup) return;
+    const edgeIdSet = new Set(edgeIds);
+    const edgeFunctionIdSet = new Set(edgeFunctionIds);
+    const directEdgesToRename = deckGraph.edges.filter((edge) => edgeIdSet.has(edge.id) && !edge.generatedByFunctionId);
+    const hasFunctionRenames = edgeFunctionIdSet.size > 0;
+    if (!directEdgesToRename.length && !hasFunctionRenames) return;
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = current[deck.id] ?? {};
+      const patchesWithRenamedFunctions = Object.fromEntries(
+        Object.entries(deckPatches).map(([patchKey, patch]) => [
+          patchKey,
+          patch.edgeFunctions?.some((edgeFunction) => edgeFunctionIdSet.has(edgeFunction.id))
+            ? {
+                ...patch,
+                edgeFunctions: patch.edgeFunctions.map((edgeFunction) =>
+                  edgeFunctionIdSet.has(edgeFunction.id) ? { ...edgeFunction, connectionGroup: targetConnectionGroup } : edgeFunction,
+                ),
+                generatedAt: new Date().toISOString(),
+              }
+            : patch,
+        ]),
+      );
+      const currentPatch = patchesWithRenamedFunctions[CONNECTION_RENAMES_PATCH_KEY];
+      const renamedDirectEdges = directEdgesToRename.map((edge) =>
+        normalizeDeckGraphEdgeId({
+          ...edge,
+          id: `${edge.sourceId}->${edge.targetId}:${edge.kind}`,
+          connectionGroup: targetConnectionGroup,
+          evidence: edge.evidence
+            ? `${edge.evidence} Connection group renamed to ${targetConnectionGroup}.`
+            : `Connection group renamed to ${targetConnectionGroup}.`,
+          generatedByFunctionId: undefined,
+        }),
+      );
+      if (!renamedDirectEdges.length) {
+        return {
+          ...current,
+          [deck.id]: patchesWithRenamedFunctions,
+        };
+      }
+      const renamedEdgeIds = new Set(renamedDirectEdges.map((edge) => edge.id));
+      const removedEdgeIds = Array.from(new Set([...(currentPatch?.edgeIdsToRemove ?? []), ...directEdgesToRename.map((edge) => edge.id)])).filter(
+        (id) => !renamedEdgeIds.has(id),
+      );
+      const edgesToUpsert = [
+        ...(currentPatch?.edgesToUpsert ?? []).filter((edge) => !edgeIdSet.has(edge.id) && !renamedEdgeIds.has(edge.id)),
+        ...renamedDirectEdges,
+      ];
+      const renamePatch: DeckGraphPatch = {
+        id: currentPatch?.id ?? `patch_${deck.id}_connection_renames`,
+        deckId: deck.id,
+        cardId: CONNECTION_RENAMES_PATCH_KEY,
+        nodesToUpsert: [],
+        edgesToUpsert,
+        edgeFunctions: [],
+        edgeIdsToRemove: removedEdgeIds,
+        notes: [`${edgesToUpsert.length} direct connection${edgesToUpsert.length === 1 ? "" : "s"} manually renamed.`],
+        generatedAt: new Date().toISOString(),
+        source: "ai",
+      };
+      return {
+        ...current,
+        [deck.id]: {
+          ...patchesWithRenamedFunctions,
+          [CONNECTION_RENAMES_PATCH_KEY]: renamePatch,
+        },
+      };
+    });
+    setDeckGraphPatchStatus(`Renamed connection group to ${targetConnectionGroup}.`);
+    setDeckGraphPatchError(undefined);
+  }
+
+  function addCardConnectionToGroup(cardId: string, selectedNodeId: string, kind: DeckGraph["edges"][number]["kind"], connectionGroup: string | undefined) {
+    if (!deck || !deckGraph) return;
+    const selectedNode = deckGraph.nodes.find((node) => node.id === selectedNodeId);
+    const cardNode = deckGraph.nodes.find((node) => node.cardId === cardId);
+    if (!selectedNode || !cardNode || selectedNode.id === cardNode.id) return;
+    const selectedIsCard = Boolean(selectedNode.cardId);
+    const sourceId = selectedIsCard ? selectedNode.id : cardNode.id;
+    const targetId = selectedIsCard ? cardNode.id : selectedNode.id;
+    const targetConnectionGroup = connectionGroup?.trim() || undefined;
+    const duplicate = deckGraph.edges.some(
+      (edge) =>
+        edge.sourceId === sourceId &&
+        edge.targetId === targetId &&
+        edge.kind === kind &&
+        (edge.connectionGroup?.trim() || undefined) === targetConnectionGroup,
+    );
+    if (duplicate) return;
+    const card = getCardById(deck, cardId);
+    const selectedLabel = selectedNode.label;
+    const addedEdge = normalizeDeckGraphEdgeId({
+      id: `${sourceId}->${targetId}:${kind}`,
+      sourceId,
+      targetId,
+      kind,
+      source: "ai-enriched",
+      strength: 3,
+      evidence: `Manually added connection${targetConnectionGroup ? ` in ${targetConnectionGroup}` : ""} between ${selectedLabel} and ${card?.name ?? "card"}.`,
+      cardIds: selectedNode.cardId ? [selectedNode.cardId, cardId] : [cardId],
+      connectionGroup: targetConnectionGroup,
+    });
+    setGraphPatchesByDeckId((current) => {
+      const deckPatches = current[deck.id] ?? {};
+      const currentPatch = deckPatches[CONNECTION_ADDITIONS_PATCH_KEY];
+      const edgesToUpsert = [...(currentPatch?.edgesToUpsert ?? []).filter((edge) => edge.id !== addedEdge.id), addedEdge];
+      const additionsPatch: DeckGraphPatch = {
+        id: currentPatch?.id ?? `patch_${deck.id}_connection_additions`,
+        deckId: deck.id,
+        cardId: CONNECTION_ADDITIONS_PATCH_KEY,
+        nodesToUpsert: [],
+        edgesToUpsert,
+        edgeFunctions: [],
+        edgeIdsToRemove: currentPatch?.edgeIdsToRemove ?? [],
+        notes: [`${edgesToUpsert.length} card connection${edgesToUpsert.length === 1 ? "" : "s"} manually added.`],
+        generatedAt: new Date().toISOString(),
+        source: "ai",
+      };
+      return {
+        ...current,
+        [deck.id]: {
+          ...deckPatches,
+          [CONNECTION_ADDITIONS_PATCH_KEY]: additionsPatch,
+        },
+      };
+    });
+    setDeckGraphPatchStatus(`Added ${card?.name ?? "card"} to ${targetConnectionGroup ?? kind}.`);
+    setDeckGraphPatchError(undefined);
   }
 
   function selectGraphNode(nodeId: string) {
@@ -1420,6 +1616,9 @@ export function App() {
             onDeleteNode={deleteGraphNode}
             onDeleteEdge={deleteGraphEdge}
             onDeleteEdges={deleteGraphEdges}
+            onMoveCardConnection={moveCardConnection}
+            onRenameConnectionGroup={renameConnectionGroup}
+            onAddCardConnectionToGroup={addCardConnectionToGroup}
             onResetHiddenNodes={resetHiddenGraphNodes}
           toolbarActions={
               <>
@@ -1477,6 +1676,9 @@ export function App() {
           onClearCardGraphPatch={() => clearCardGraphPatch(modalCard.id)}
           onDeleteGraphEdge={deleteGraphEdge}
           onDeleteGraphEdges={deleteGraphEdges}
+          onMoveCardConnection={moveCardConnection}
+          onRenameConnectionGroup={renameConnectionGroup}
+          onAddCardConnectionToGroup={addCardConnectionToGroup}
           onSelectCard={openCardModal}
           hoverPreview={hoverPreview}
           onDeleteAnalysisNode={modalCardAnalysis ? (path) => deleteAnalysisNode(modalCardAnalysis.id, path) : undefined}
@@ -1504,6 +1706,9 @@ function CardDetailModal({
   onClearCardGraphPatch,
   onDeleteGraphEdge,
   onDeleteGraphEdges,
+  onMoveCardConnection,
+  onRenameConnectionGroup,
+  onAddCardConnectionToGroup,
   onSelectCard,
   hoverPreview,
   onDeleteAnalysisNode,
@@ -1523,6 +1728,9 @@ function CardDetailModal({
   onClearCardGraphPatch: () => void;
   onDeleteGraphEdge: (edgeId: string) => void;
   onDeleteGraphEdges: (edgeIds: string[], label?: string) => void;
+  onMoveCardConnection: (edgeId: string, connectionGroup: string | undefined) => void;
+  onRenameConnectionGroup: (edgeIds: string[], edgeFunctionIds: string[], connectionGroup: string) => void;
+  onAddCardConnectionToGroup: (cardId: string, selectedNodeId: string, kind: DeckGraph["edges"][number]["kind"], connectionGroup: string | undefined) => void;
   onSelectCard: (cardId: string) => void;
   hoverPreview: HoverPreviewHandlers;
   onDeleteAnalysisNode?: (path: AnalysisNodePath) => void;
@@ -1665,6 +1873,9 @@ function CardDetailModal({
                 onOpenCard={onSelectCard}
                 onDeleteEdge={onDeleteGraphEdge}
                 onDeleteEdges={onDeleteGraphEdges}
+                onMoveCardConnection={onMoveCardConnection}
+                onRenameConnectionGroup={onRenameConnectionGroup}
+                onAddCardConnectionToGroup={onAddCardConnectionToGroup}
                 onCopyConnectionsJson={graphPatch ? () => void copyGraphPatchJson() : undefined}
                 onDeleteConnectionsPatch={graphPatch ? onClearCardGraphPatch : undefined}
                 hoverPreview={hoverPreview}
