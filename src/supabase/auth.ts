@@ -49,7 +49,7 @@ export async function sendSupabaseMagicLink(email: string): Promise<void> {
   const { error } = await supabase.auth.signInWithOtp({
     email,
     options: {
-      emailRedirectTo: window.location.origin,
+      emailRedirectTo: new URL(import.meta.env.BASE_URL, window.location.origin).toString(),
     },
   });
   if (error) throw new Error(error.message);
