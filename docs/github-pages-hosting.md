@@ -5,28 +5,18 @@ The app is prepared for GitHub Pages deployment through `.github/workflows/deplo
 Expected Pages URL if the repository supports Pages:
 
 ```txt
-https://zachariascade.github.io/CloudArchideckture/
+https://zachariascade.github.io/CardArchipelago/
 ```
 
-## Current Blocker
+## Current Status
 
-The repository is currently private:
+The repository is public:
 
 ```txt
-zachariascade/CloudArchideckture
+zachariascade/CardArchipelago
 ```
 
-GitHub returned this error when enabling Pages:
-
-```txt
-Your current plan does not support GitHub Pages for this repository.
-```
-
-Options:
-
-- Make the repository public, then enable GitHub Pages with GitHub Actions as the source.
-- Upgrade/use a GitHub plan that supports Pages for private repositories.
-- Deploy the same static app to Vercel or Netlify instead.
+GitHub Pages is enabled with GitHub Actions as the deployment source.
 
 ## Repository Variables
 
@@ -43,7 +33,7 @@ VITE_ANALYSIS_ENDPOINT
 If GitHub Pages is enabled, add this URL to Supabase Auth redirect URLs:
 
 ```txt
-https://zachariascade.github.io/CloudArchideckture/
+https://zachariascade.github.io/CardArchipelago/
 ```
 
 Keep local development redirect URLs too:
