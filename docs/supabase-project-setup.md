@@ -47,10 +47,18 @@ In the Supabase dashboard:
 1. Go to Authentication.
 2. Confirm email sign-in is enabled.
 3. Confirm magic-link/OTP email delivery is enabled.
-4. Add local development URL as an allowed redirect URL:
+4. Set the Site URL to the deployed app:
 
 ```txt
-http://localhost:5173
+https://zachariascade.github.io/CardArchipelago/
+```
+
+5. Add hosted and local development URLs as allowed redirect URLs:
+
+```txt
+https://zachariascade.github.io/CardArchipelago/**
+http://localhost:5173/**
+http://127.0.0.1:5173/**
 ```
 
 If Vite uses a different local port, add that URL too.

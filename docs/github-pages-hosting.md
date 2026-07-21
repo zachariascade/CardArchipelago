@@ -36,8 +36,15 @@ If GitHub Pages is enabled, add this URL to Supabase Auth redirect URLs:
 https://zachariascade.github.io/CardArchipelago/
 ```
 
+Also set the Supabase Auth Site URL to:
+
+```txt
+https://zachariascade.github.io/CardArchipelago/
+```
+
 Keep local development redirect URLs too:
 
 ```txt
-http://localhost:5173
+http://localhost:5173/**
+http://127.0.0.1:5173/**
 ```
