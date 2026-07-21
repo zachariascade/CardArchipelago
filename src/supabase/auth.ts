@@ -60,3 +60,22 @@ export async function signOutOfSupabase(): Promise<void> {
   const { error } = await supabase.auth.signOut();
   if (error) throw new Error(error.message);
 }
+
+export async function refreshSupabaseSession(): Promise<void> {
+  if (!supabase) throw new Error("Supabase is not configured.");
+  const { data: currentSession, error: sessionError } = await supabase.auth.getSession();
+  if (sessionError) throw new Error(sessionError.message);
+  if (!currentSession.session) throw new Error("Sign in before using cloud sync.");
+
+  const { error: refreshError } = await supabase.auth.refreshSession();
+  if (refreshError) {
+    throw new Error(getSupabaseAuthErrorMessage(refreshError.message));
+  }
+}
+
+function getSupabaseAuthErrorMessage(message: string): string {
+  if (message.toLowerCase().includes("jwt issued at future")) {
+    return "Supabase rejected the current session token because its timestamp is in the future. Sign out and sign back in; if it keeps happening, check that your device date, time, and time zone are set automatically.";
+  }
+  return message;
+}

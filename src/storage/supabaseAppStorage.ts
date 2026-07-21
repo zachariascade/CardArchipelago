@@ -1,6 +1,7 @@
 import { AnalysisResult } from "../analysis/analysisSchema";
 import { DeckGraphPatch } from "../deck/deckGraph";
 import { DeckSnapshot } from "../deck/deckModel";
+import { refreshSupabaseSession } from "../supabase/auth";
 import { supabase } from "../supabase/client";
 import { AppStorageRepository } from "./appStorage";
 import { QuestionThread, StoredAppState, defaultStoredState } from "./localDeckStorage";
@@ -50,6 +51,7 @@ export class SupabaseAppStorageRepository implements AppStorageRepository {
 
   async loadAppState(): Promise<StoredAppState> {
     if (!supabase) throw new Error("Supabase is not configured.");
+    await refreshSupabaseSession();
 
     const [appStateResult, decksResult, analysesResult, graphPatchesResult, questionThreadsResult, questionMessagesResult] = await Promise.all([
       supabase.from("user_app_states").select("state").eq("user_id", this.userId).maybeSingle(),
@@ -95,6 +97,7 @@ export class SupabaseAppStorageRepository implements AppStorageRepository {
 
   async saveAppState(state: StoredAppState): Promise<void> {
     if (!supabase) throw new Error("Supabase is not configured.");
+    await refreshSupabaseSession();
 
     await this.clearUserDataRows();
     await this.upsertAppState(state);
@@ -279,5 +282,9 @@ function groupQuestionThreadsByDeckId(
 }
 
 function assertSupabaseResult(error: { message: string } | null): void {
-  if (error) throw new Error(error.message);
+  if (!error) return;
+  if (error.message.toLowerCase().includes("jwt issued at future")) {
+    throw new Error("Supabase rejected the current session token because its timestamp is in the future. Sign out and sign back in; if it keeps happening, check that your device date, time, and time zone are set automatically.");
+  }
+  throw new Error(error.message);
 }
