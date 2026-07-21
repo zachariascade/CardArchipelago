@@ -5,9 +5,10 @@ import { DeckSnapshot, getEntryBoard } from "../deck/deckModel";
 const STORAGE_KEY = "mtg-deck-explorer:v1";
 
 export type ProviderConfig = {
-  mode: "mock" | "local";
+  mode: "mock" | "local" | "hosted";
   endpointUrl: string;
   codexModel: string;
+  hostedModel: string;
   codexReasoningEffort: "low" | "medium" | "high";
 };
 
@@ -59,6 +60,7 @@ export const defaultStoredState: StoredAppState = {
     mode: "mock",
     endpointUrl: "http://localhost:8787/analyze",
     codexModel: "gpt-5.4",
+    hostedModel: "gpt-5",
     codexReasoningEffort: "low",
   },
 };

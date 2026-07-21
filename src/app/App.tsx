@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Brain, MoreHorizontal, Plus, RefreshCw, Sparkles, Trash2, X } from "lucide-react";
-import { AnalysisLayoutNode, AnalysisResult } from "../analysis/analysisSchema";
+import { AnalysisLayoutNode, AnalysisResult, AnalysisSource } from "../analysis/analysisSchema";
+import { HostedAnalysisProvider } from "../analysis/HostedAnalysisProvider";
 import { LocalEndpointAnalysisProvider } from "../analysis/LocalEndpointAnalysisProvider";
 import { MockAnalysisProvider } from "../analysis/MockAnalysisProvider";
 import { AnalysisRenderer, type AnalysisNodePath } from "../components/analysis-renderer/AnalysisRenderer";
@@ -14,7 +15,11 @@ import { DeckGraph, DeckGraphPatch, applyGraphPatches, buildDeckGraph, getConnec
 import { availableQueries, getCardById, getCommander } from "../deck/deckQueries";
 import { ParsedDecklist, parseDecklist } from "../deck/parseDecklist";
 import { fetchCardAutocompleteNames, fetchFuzzyCardByName, hydrateDeckEntries, slugify } from "../deck/scryfall";
-import { ProviderConfig, QuestionThread, StoredDeckGraphState, loadStoredState, saveStoredState } from "../storage/localDeckStorage";
+import { localAppStorageRepository } from "../storage/appStorage";
+import { ProviderConfig, QuestionThread, StoredAppState, StoredDeckGraphState } from "../storage/localDeckStorage";
+import { SupabaseAppStorageRepository } from "../storage/supabaseAppStorage";
+import { sendSupabaseMagicLink, signOutOfSupabase, useSupabaseAuth, type SupabaseAuthState } from "../supabase/auth";
+import { hasSupabaseConfig } from "../supabase/client";
 
 const EDGE_DELETIONS_PATCH_KEY = "__edge_deletions__";
 const NODE_DELETIONS_PATCH_KEY = "__node_deletions__";
@@ -34,7 +39,14 @@ type CardPreviewState = {
   top: number;
 };
 
+function getAnalysisSourceForProvider(mode: ProviderConfig["mode"]): AnalysisSource {
+  if (mode === "hosted") return "openai";
+  if (mode === "local") return "custom";
+  return "mock";
+}
+
 export function App() {
+  const authState = useSupabaseAuth();
   const [deckText, setDeckText] = useState(DEFAULT_DECKLIST);
   const [archidektUrl, setArchidektUrl] = useState("");
   const [decks, setDecks] = useState<DeckSnapshot[]>([]);
@@ -49,6 +61,7 @@ export function App() {
     mode: "mock",
     endpointUrl: "http://localhost:8787/analyze",
     codexModel: "gpt-5.4",
+    hostedModel: "gpt-5",
     codexReasoningEffort: "low",
   });
   const [warnings, setWarnings] = useState<string[]>([]);
@@ -81,22 +94,19 @@ export function App() {
   const [activeView, setActiveView] = useState<"import" | "deck" | "analysis" | "ask" | "graph">("deck");
 
   useEffect(() => {
-    const stored = loadStoredState();
-    setDecks(stored.decks);
-    setActiveDeckId(stored.activeDeckId);
-    setSelectedCardId(stored.selectedCardId);
-    setAnalysesByDeckId(stored.analysesByDeckId);
-    setGraphStateByDeckId(stored.graphStateByDeckId);
-    setGraphPatchesByDeckId(stored.graphPatchesByDeckId);
-    setQuestionThreadsByDeckId(stored.questionThreadsByDeckId);
-    setActiveQuestionThreadIdByDeckId(stored.activeQuestionThreadIdByDeckId);
-    setProviderConfig(stored.providerConfig);
-    setHasLoadedStorage(true);
+    let isMounted = true;
+    localAppStorageRepository.loadAppState().then((stored) => {
+      if (!isMounted) return;
+      applyStoredState(stored);
+      setHasLoadedStorage(true);
+    });
+    return () => {
+      isMounted = false;
+    };
   }, []);
 
-  useEffect(() => {
-    if (!hasLoadedStorage) return;
-    saveStoredState({
+  const currentStoredState = useMemo<StoredAppState>(
+    () => ({
       decks,
       activeDeckId,
       analysesByDeckId,
@@ -108,21 +118,31 @@ export function App() {
       selectedGraphNodeId: activeDeckId ? graphStateByDeckId[activeDeckId]?.selectedNodeId : undefined,
       analyses: [],
       providerConfig,
-    });
-  }, [
-    decks,
-    activeDeckId,
-    analysesByDeckId,
-    graphStateByDeckId,
-    graphPatchesByDeckId,
-    questionThreadsByDeckId,
-    activeQuestionThreadIdByDeckId,
-    selectedCardId,
-    providerConfig,
-    hasLoadedStorage,
-  ]);
+    }),
+    [
+      decks,
+      activeDeckId,
+      analysesByDeckId,
+      graphStateByDeckId,
+      graphPatchesByDeckId,
+      questionThreadsByDeckId,
+      activeQuestionThreadIdByDeckId,
+      selectedCardId,
+      providerConfig,
+    ],
+  );
+
+  useEffect(() => {
+    if (!hasLoadedStorage) return;
+    void localAppStorageRepository.saveAppState(currentStoredState);
+  }, [currentStoredState, hasLoadedStorage]);
 
   const provider = useMemo(() => {
+    if (providerConfig.mode === "hosted") {
+      return new HostedAnalysisProvider({
+        model: providerConfig.hostedModel,
+      });
+    }
     if (providerConfig.mode === "local") {
       return new LocalEndpointAnalysisProvider(providerConfig.endpointUrl, {
         codexModel: providerConfig.codexModel,
@@ -131,6 +151,29 @@ export function App() {
     }
     return new MockAnalysisProvider();
   }, [providerConfig]);
+
+  async function migrateLocalDataToCloud() {
+    if (!authState.user) throw new Error("Sign in before copying local data to cloud.");
+    await new SupabaseAppStorageRepository(authState.user.id).saveAppState(currentStoredState);
+  }
+
+  async function loadCloudData() {
+    if (!authState.user) throw new Error("Sign in before loading cloud data.");
+    const stored = await new SupabaseAppStorageRepository(authState.user.id).loadAppState();
+    applyStoredState(stored);
+  }
+
+  function applyStoredState(stored: StoredAppState) {
+    setDecks(stored.decks);
+    setActiveDeckId(stored.activeDeckId);
+    setSelectedCardId(stored.selectedCardId);
+    setAnalysesByDeckId(stored.analysesByDeckId);
+    setGraphStateByDeckId(stored.graphStateByDeckId);
+    setGraphPatchesByDeckId(stored.graphPatchesByDeckId);
+    setQuestionThreadsByDeckId(stored.questionThreadsByDeckId);
+    setActiveQuestionThreadIdByDeckId(stored.activeQuestionThreadIdByDeckId);
+    setProviderConfig(stored.providerConfig);
+  }
 
   const deck = useMemo(() => decks.find((savedDeck) => savedDeck.id === activeDeckId), [decks, activeDeckId]);
   const analyses = deck ? analysesByDeckId[deck.id] ?? [] : [];
@@ -561,7 +604,7 @@ export function App() {
             summary: message,
             layout: { type: "NarrativePanel", title: "Graph Patch Error", body: message },
             createdAt: new Date().toISOString(),
-            source: providerConfig.mode === "local" ? "custom" : "mock",
+            source: getAnalysisSourceForProvider(providerConfig.mode),
           },
           ...(current[deck.id] ?? []),
         ],
@@ -617,7 +660,7 @@ export function App() {
             summary: message,
             layout: { type: "NarrativePanel", title: "Graph Patch Error", body: message },
             createdAt: new Date().toISOString(),
-            source: providerConfig.mode === "local" ? "custom" : "mock",
+            source: getAnalysisSourceForProvider(providerConfig.mode),
           },
           ...(current[deck.id] ?? []),
         ],
@@ -676,7 +719,7 @@ export function App() {
             summary: message,
             layout: { type: "NarrativePanel", title: "Deck Graph Patch Error", body: message },
             createdAt: new Date().toISOString(),
-            source: providerConfig.mode === "local" ? "custom" : "mock",
+            source: getAnalysisSourceForProvider(providerConfig.mode),
           },
           ...(current[deck.id] ?? []),
         ],
@@ -1285,7 +1328,7 @@ export function App() {
           reasoningSummary: "The provider request failed before an analysis could be generated. The app captured the error and rendered it as an analysis result so it can be reviewed.",
           layout: { type: "NarrativePanel", title: "Provider Error", body: message },
           createdAt: new Date().toISOString(),
-          source: providerConfig.mode === "local" ? "custom" : "mock",
+          source: getAnalysisSourceForProvider(providerConfig.mode),
           },
           ...(current[deck.id] ?? []),
         ],
@@ -1302,36 +1345,46 @@ export function App() {
           <h1>MTG Deck Explorer</h1>
           <p>Local-first Commander workbench with query-backed analysis panels.</p>
         </div>
-        <div className="provider-control">
-          <select value={providerConfig.mode} onChange={(event) => setProviderConfig((current) => ({ ...current, mode: event.target.value as ProviderConfig["mode"] }))}>
-            <option value="mock">Mock AI</option>
-            <option value="local">Local endpoint</option>
-          </select>
-          <input
-            value={providerConfig.endpointUrl}
-            onChange={(event) => setProviderConfig((current) => ({ ...current, endpointUrl: event.target.value }))}
-            disabled={providerConfig.mode !== "local"}
-            aria-label="Local endpoint URL"
-          />
-          <select
-            value={providerConfig.codexModel}
-            onChange={(event) => setProviderConfig((current) => ({ ...current, codexModel: event.target.value }))}
-            disabled={providerConfig.mode !== "local"}
-            aria-label="Codex model"
-          >
-            <option value="gpt-5.4">GPT-5.4</option>
-            <option value="gpt-5.5">GPT-5.5</option>
-          </select>
-          <select
-            value={providerConfig.codexReasoningEffort}
-            onChange={(event) => setProviderConfig((current) => ({ ...current, codexReasoningEffort: event.target.value as ProviderConfig["codexReasoningEffort"] }))}
-            disabled={providerConfig.mode !== "local"}
-            aria-label="Codex reasoning effort"
-          >
-            <option value="low">Low effort</option>
-            <option value="medium">Medium effort</option>
-            <option value="high">High effort</option>
-          </select>
+        <div className="header-controls">
+          <CloudAuthControl authState={authState} onMigrateLocalData={migrateLocalDataToCloud} onLoadCloudData={loadCloudData} />
+          <div className="provider-control">
+            <select value={providerConfig.mode} onChange={(event) => setProviderConfig((current) => ({ ...current, mode: event.target.value as ProviderConfig["mode"] }))}>
+              <option value="mock">Mock AI</option>
+              <option value="local">Local endpoint</option>
+              <option value="hosted">Hosted Supabase</option>
+            </select>
+            <input
+              value={providerConfig.endpointUrl}
+              onChange={(event) => setProviderConfig((current) => ({ ...current, endpointUrl: event.target.value }))}
+              disabled={providerConfig.mode !== "local"}
+              aria-label="Local endpoint URL"
+            />
+            <input
+              value={providerConfig.hostedModel}
+              onChange={(event) => setProviderConfig((current) => ({ ...current, hostedModel: event.target.value }))}
+              disabled={providerConfig.mode !== "hosted"}
+              aria-label="Hosted OpenAI model"
+            />
+            <select
+              value={providerConfig.codexModel}
+              onChange={(event) => setProviderConfig((current) => ({ ...current, codexModel: event.target.value }))}
+              disabled={providerConfig.mode !== "local"}
+              aria-label="Codex model"
+            >
+              <option value="gpt-5.4">GPT-5.4</option>
+              <option value="gpt-5.5">GPT-5.5</option>
+            </select>
+            <select
+              value={providerConfig.codexReasoningEffort}
+              onChange={(event) => setProviderConfig((current) => ({ ...current, codexReasoningEffort: event.target.value as ProviderConfig["codexReasoningEffort"] }))}
+              disabled={providerConfig.mode !== "local"}
+              aria-label="Codex reasoning effort"
+            >
+              <option value="low">Low effort</option>
+              <option value="medium">Medium effort</option>
+              <option value="high">High effort</option>
+            </select>
+          </div>
         </div>
       </header>
 
@@ -1688,6 +1741,117 @@ export function App() {
 
       {previewCard && cardPreview && <CardHoverPreview card={previewCard} left={cardPreview.left} top={cardPreview.top} />}
     </main>
+  );
+}
+
+function CloudAuthControl({
+  authState,
+  onMigrateLocalData,
+  onLoadCloudData,
+}: {
+  authState: SupabaseAuthState;
+  onMigrateLocalData: () => Promise<void>;
+  onLoadCloudData: () => Promise<void>;
+}) {
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) return;
+    setIsSubmitting(true);
+    setStatus(undefined);
+    setError(undefined);
+    try {
+      await sendSupabaseMagicLink(trimmedEmail);
+      setStatus("Magic link sent");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not send sign-in link.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleSignOut() {
+    setIsSubmitting(true);
+    setStatus(undefined);
+    setError(undefined);
+    try {
+      await signOutOfSupabase();
+      setEmail("");
+      setStatus("Signed out");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not sign out.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleMigrateLocalData() {
+    setIsSubmitting(true);
+    setStatus(undefined);
+    setError(undefined);
+    try {
+      await onMigrateLocalData();
+      setStatus("Local data copied");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not copy local data.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleLoadCloudData() {
+    setIsSubmitting(true);
+    setStatus(undefined);
+    setError(undefined);
+    try {
+      await onLoadCloudData();
+      setStatus("Cloud data loaded");
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not load cloud data.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  if (!hasSupabaseConfig) {
+    return <div className="cloud-auth-status">Cloud not configured</div>;
+  }
+
+  if (authState.isLoading) {
+    return <div className="cloud-auth-status">Checking cloud session...</div>;
+  }
+
+  if (authState.user) {
+    return (
+      <div className="cloud-auth-control">
+        <span className="cloud-auth-status">Cloud: {authState.user.email ?? "signed in"}</span>
+        <button type="button" onClick={() => void handleLoadCloudData()} disabled={isSubmitting}>
+          Load cloud data
+        </button>
+        <button type="button" onClick={() => void handleMigrateLocalData()} disabled={isSubmitting}>
+          Copy local data
+        </button>
+        <button type="button" onClick={() => void handleSignOut()} disabled={isSubmitting}>
+          Sign out
+        </button>
+        {(status || error || authState.error) && <span className={error || authState.error ? "cloud-auth-error" : "cloud-auth-note"}>{error ?? authState.error ?? status}</span>}
+      </div>
+    );
+  }
+
+  return (
+    <form className="cloud-auth-control" onSubmit={handleSubmit}>
+      <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email for cloud sync" aria-label="Email for cloud sync" />
+      <button type="submit" disabled={isSubmitting || !email.trim()}>
+        {isSubmitting ? "Sending..." : "Sign in"}
+      </button>
+      {(status || error || authState.error) && <span className={error || authState.error ? "cloud-auth-error" : "cloud-auth-note"}>{error ?? authState.error ?? status}</span>}
+    </form>
   );
 }
 

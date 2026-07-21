@@ -71,6 +71,14 @@ p {
   color: #687075;
 }
 
+.header-controls {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
+.cloud-auth-control,
+.cloud-auth-status,
 .provider-control,
 .toolbar,
 .import-actions,
@@ -83,6 +91,7 @@ p {
   flex-wrap: wrap;
 }
 
+.cloud-auth-control input,
 .provider-control input,
 .provider-control select,
 .archidekt-import input,
@@ -95,6 +104,7 @@ textarea {
   border-radius: 6px;
 }
 
+.cloud-auth-control input,
 .provider-control input,
 .provider-control select,
 .archidekt-import input,
@@ -106,6 +116,45 @@ textarea {
 
 .provider-control input {
   width: min(280px, 45vw);
+}
+
+.cloud-auth-control input {
+  width: min(220px, 36vw);
+}
+
+.cloud-auth-control button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 6px;
+  background: #233137;
+  color: #fffdf8;
+  font-weight: 800;
+  padding: 0 12px;
+}
+
+.cloud-auth-control button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.cloud-auth-status {
+  color: #4d585c;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.cloud-auth-note,
+.cloud-auth-error {
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.cloud-auth-note {
+  color: #3c6f51;
+}
+
+.cloud-auth-error {
+  color: #9c3b31;
 }
 
 .import-panel,
@@ -2869,6 +2918,16 @@ textarea {
     width: 100%;
   }
 
+  .header-controls {
+    justify-items: stretch;
+  }
+
+  .cloud-auth-control,
+  .cloud-auth-status {
+    width: 100%;
+  }
+
+  .cloud-auth-control input,
   .provider-control input {
     width: 100%;
   }
